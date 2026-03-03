@@ -5,7 +5,7 @@
  * Immutable representation of a page's trust score with validation and business logic
  * 
  * @package BCCTrust\ValueObjects
- * @version 2.0.0
+ * @version 2.1.0
  */
 
 namespace BCCTrust\ValueObjects;
@@ -31,6 +31,7 @@ class PageScore {
     private int $endorsementCount;
     private ?DateTimeImmutable $lastVoteAt;
     private DateTimeImmutable $lastCalculatedAt;
+    private ?array $fraudMetadata;  // Added missing field
 
     /**
      * Valid tier values
@@ -52,7 +53,8 @@ class PageScore {
         string $reputationTier,
         int $endorsementCount,
         ?DateTimeImmutable $lastVoteAt,
-        ?DateTimeImmutable $lastCalculatedAt = null
+        ?DateTimeImmutable $lastCalculatedAt = null,
+        ?array $fraudMetadata = null  // Added parameter
     ) {
         // Validate all inputs
         $this->validatePageId($pageId);
@@ -76,6 +78,7 @@ class PageScore {
         $this->endorsementCount = $endorsementCount;
         $this->lastVoteAt = $lastVoteAt;
         $this->lastCalculatedAt = $lastCalculatedAt ?? new DateTimeImmutable();
+        $this->fraudMetadata = $fraudMetadata;
     }
 
     /**
@@ -116,6 +119,14 @@ class PageScore {
         if ($negative < 0) {
             throw new InvalidArgumentException(
                 sprintf('Negative score cannot be negative, got: %f', $negative)
+            );
+        }
+
+        // Validate that total roughly equals 50 + (positive - negative) * 2
+        $expectedTotal = 50 + (($positive - $negative) * 2);
+        if (abs($total - $expectedTotal) > 0.1 && ($positive > 0 || $negative > 0)) {
+            throw new InvalidArgumentException(
+                sprintf('Total score %f does not match positive/negative differential', $total)
             );
         }
     }
@@ -220,6 +231,10 @@ class PageScore {
     public function getLastCalculatedAt(): DateTimeImmutable {
         return $this->lastCalculatedAt;
     }
+    
+    public function getFraudMetadata(): ?array {
+        return $this->fraudMetadata;
+    }
 
     /**
      * ======================================================
@@ -284,6 +299,28 @@ class PageScore {
     }
 
     /**
+     * Check if page has any fraud alerts
+     */
+    public function hasFraudAlerts(): bool {
+        if (empty($this->fraudMetadata)) {
+            return false;
+        }
+        
+        return isset($this->fraudMetadata['alerts']) && count($this->fraudMetadata['alerts']) > 0;
+    }
+
+    /**
+     * Get fraud alert count
+     */
+    public function getFraudAlertCount(): int {
+        if (empty($this->fraudMetadata) || !isset($this->fraudMetadata['alerts'])) {
+            return 0;
+        }
+        
+        return count($this->fraudMetadata['alerts']);
+    }
+
+    /**
      * ======================================================
      * IMMUTABLE TRANSFORMATIONS
      * ======================================================
@@ -322,7 +359,46 @@ class PageScore {
             $newTier,
             $this->endorsementCount,
             new DateTimeImmutable(), // last vote at = now
-            new DateTimeImmutable()  // last calculated at = now
+            new DateTimeImmutable(), // last calculated at = now
+            $this->fraudMetadata
+        );
+    }
+    
+    /**
+     * Create new instance with a vote removed
+     */
+    public function withVoteRemoved(float $voteWeight, bool $wasPositive, bool $wasUniqueVoter): self {
+        // Calculate new scores
+        $newPositive = max(0, $this->positiveScore - ($wasPositive ? $voteWeight : 0));
+        $newNegative = max(0, $this->negativeScore - ($wasPositive ? 0 : $voteWeight));
+        $newVoteCount = max(0, $this->voteCount - 1);
+        $newUniqueVoters = $this->uniqueVoters - ($wasUniqueVoter ? 1 : 0);
+        
+        // Recalculate total score
+        $netScore = $newPositive - $newNegative;
+        $newTotalScore = 50 + ($netScore * 2);
+        $newTotalScore = max(0, min(100, $newTotalScore));
+        
+        // Recalculate confidence
+        $newConfidence = $this->recalculateConfidence($newVoteCount, $newUniqueVoters);
+        
+        // Determine new tier
+        $newTier = $this->determineTier($newTotalScore);
+        
+        return new self(
+            $this->pageId,
+            $this->pageOwnerId,
+            $newTotalScore,
+            $newPositive,
+            $newNegative,
+            $newVoteCount,
+            $newUniqueVoters,
+            $newConfidence,
+            $newTier,
+            $this->endorsementCount,
+            $this->lastVoteAt, // Keep original last vote
+            new DateTimeImmutable(), // last calculated at = now
+            $this->fraudMetadata
         );
     }
     
@@ -351,7 +427,8 @@ class PageScore {
             $this->reputationTier,
             $this->endorsementCount + 1,
             $this->lastVoteAt,
-            new DateTimeImmutable()
+            new DateTimeImmutable(),
+            $this->fraudMetadata
         );
     }
     
@@ -379,7 +456,29 @@ class PageScore {
             $this->reputationTier,
             max(0, $this->endorsementCount - 1),
             $this->lastVoteAt,
-            new DateTimeImmutable()
+            new DateTimeImmutable(),
+            $this->fraudMetadata
+        );
+    }
+    
+    /**
+     * Create new instance with fraud metadata updated
+     */
+    public function withFraudMetadata(array $fraudMetadata): self {
+        return new self(
+            $this->pageId,
+            $this->pageOwnerId,
+            $this->totalScore,
+            $this->positiveScore,
+            $this->negativeScore,
+            $this->voteCount,
+            $this->uniqueVoters,
+            $this->confidenceScore,
+            $this->reputationTier,
+            $this->endorsementCount,
+            $this->lastVoteAt,
+            $this->lastCalculatedAt,
+            $fraudMetadata
         );
     }
     
@@ -430,7 +529,8 @@ class PageScore {
             $row->reputation_tier,
             (int) $row->endorsement_count,
             $row->last_vote_at ? new DateTimeImmutable($row->last_vote_at) : null,
-            $row->last_calculated_at ? new DateTimeImmutable($row->last_calculated_at) : null
+            $row->last_calculated_at ? new DateTimeImmutable($row->last_calculated_at) : null,
+            !empty($row->fraud_metadata) ? json_decode($row->fraud_metadata, true) : null
         );
     }
     
@@ -450,7 +550,8 @@ class PageScore {
             'neutral',
             0,     // endorsement_count
             null,  // last_vote_at
-            new DateTimeImmutable()
+            new DateTimeImmutable(),
+            null   // fraud_metadata
         );
     }
 
@@ -476,7 +577,8 @@ class PageScore {
             'reputation_tier' => $this->reputationTier,
             'endorsement_count' => $this->endorsementCount,
             'last_vote_at' => $this->lastVoteAt?->format('Y-m-d H:i:s'),
-            'last_calculated_at' => $this->lastCalculatedAt->format('Y-m-d H:i:s')
+            'last_calculated_at' => $this->lastCalculatedAt->format('Y-m-d H:i:s'),
+            'fraud_metadata' => $this->fraudMetadata ? json_encode($this->fraudMetadata) : null
         ];
     }
     
@@ -497,7 +599,9 @@ class PageScore {
             'status' => $this->getScoreStatus(),
             'has_sufficient_data' => $this->hasSufficientData(),
             'voter_diversity' => $this->getVoterDiversity(),
-            'net_score' => $this->getNetScore()
+            'net_score' => $this->getNetScore(),
+            'has_fraud_alerts' => $this->hasFraudAlerts(),
+            'fraud_alert_count' => $this->getFraudAlertCount()
         ];
     }
     
@@ -511,7 +615,8 @@ class PageScore {
             'reputation_tier' => $this->reputationTier,
             'confidence' => $this->confidenceScore,
             'vote_count' => $this->voteCount,
-            'endorsement_count' => $this->endorsementCount
+            'endorsement_count' => $this->endorsementCount,
+            'has_fraud_alerts' => $this->hasFraudAlerts()
         ];
     }
 

@@ -1,0 +1,21 @@
+/* BCC Trust Widget Styling */
+.bcc-trust-widget {
+    margin: 25px 0;
+    padding: 20px;
+    background: #f8f9fa;
+    border: 1px solid #e9ecef;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+}
+
+/* Optional: Add a subtle header */
+.bcc-trust-widget::before {
+    content: "📊 Community Trust";
+    display: block;
+    font-weight: 600;
+    font-size: 1.1em;
+    color: #2c3e50;
+    margin-bottom: 15px;
+    padding-bottom: 10px;
+    border-bottom: 2px solid #e9ecef;
+}

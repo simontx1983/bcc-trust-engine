@@ -3,6 +3,7 @@ namespace BCCTrust\Services;
 
 use Exception;
 use BCCTrust\Repositories\VerificationRepository;
+use BCCTrust\Repositories\UserInfoRepository;
 use BCCTrust\Security\RateLimiter;
 use BCCTrust\Security\AuditLogger;
 
@@ -13,9 +14,11 @@ if (!defined('ABSPATH')) {
 class VerificationService {
 
     private VerificationRepository $repo;
+    private UserInfoRepository $userInfoRepo;
 
     public function __construct() {
         $this->repo = new VerificationRepository();
+        $this->userInfoRepo = new UserInfoRepository();
     }
 
     /**
@@ -70,12 +73,8 @@ class VerificationService {
             throw new Exception('Invalid or expired verification token');
         }
 
-        // Mark as verified
+        // Mark as verified (this will also update user_info via the repository)
         $this->repo->markVerified($record->id);
-
-        // Update user meta
-        update_user_meta($userId, 'bcc_trust_email_verified', 1);
-        update_user_meta($userId, 'bcc_trust_verified_at', current_time('mysql'));
 
         // Clear any existing tokens
         $this->cleanupUserTokens($userId);
@@ -86,10 +85,15 @@ class VerificationService {
         // Trigger action for other plugins
         do_action('bcc_trust_user_verified', $userId);
 
+        // Get updated user info for response
+        $userInfo = $this->userInfoRepo->getByUserId($userId);
+
         return [
             'success' => true,
             'message' => 'Email verified successfully',
-            'verified_at' => current_time('mysql')
+            'verified_at' => current_time('mysql'),
+            'user_id' => $userId,
+            'trust_boost' => $userInfo ? ($userInfo->trust_rank > 0 ? true : false) : false
         ];
     }
 
@@ -109,32 +113,35 @@ class VerificationService {
     }
 
     /**
-     * Check if user is verified
+     * Check if user is verified using user_info table
      */
     public function isVerified(int $userId): bool {
-        // Check user meta first (fast)
-        $verified = get_user_meta($userId, 'bcc_trust_email_verified', true);
+        // Get from user_info table (source of truth)
+        $userInfo = $this->userInfoRepo->getByUserId($userId);
         
-        if ($verified) {
-            return true;
+        if ($userInfo) {
+            return (bool) $userInfo->is_verified;
         }
 
-        // Double-check with repository
+        // Fallback to repository check if user_info not found
         return $this->repo->isVerified($userId);
     }
 
     /**
-     * Get verification status
+     * Get verification status from user_info table
      */
     public function getVerificationStatus(int $userId): array {
         $record = $this->repo->getForUser($userId);
+        $userInfo = $this->userInfoRepo->getByUserId($userId);
 
         return [
             'user_id' => $userId,
-            'is_verified' => $this->isVerified($userId),
+            'is_verified' => $userInfo ? (bool) $userInfo->is_verified : false,
             'verified_at' => $record && $record->verified_at ? $record->verified_at : null,
             'last_request_at' => $record ? $record->created_at : null,
-            'token_expires_at' => $record && !$record->verified_at ? $record->expires_at : null
+            'token_expires_at' => $record && !$record->verified_at ? $record->expires_at : null,
+            'trust_rank' => $userInfo ? $userInfo->trust_rank : 0,
+            'fraud_score' => $userInfo ? $userInfo->fraud_score : 0
         ];
     }
 
@@ -221,7 +228,7 @@ class VerificationService {
     private function cleanupUserTokens(int $userId): void {
         global $wpdb;
         
-        $table = $wpdb->prefix . 'bcc_trust_verifications';
+        $table = bcc_trust_verifications_table();
         
         $wpdb->delete($table, [
             'user_id' => $userId,
@@ -238,6 +245,49 @@ class VerificationService {
             'token' => $token,
             'user_id' => $userId
         ], home_url('/verify-email'));
+    }
+
+    /**
+     * Get verification statistics
+     */
+    public function getStats(): array {
+        return [
+            'total_verified' => $this->userInfoRepo->countVerified(),
+            'total_pending' => $this->repo->getPendingCount(),
+            'completion_rate' => $this->repo->getCompletionRate()
+        ];
+    }
+
+    /**
+     * Admin: Manually verify a user
+     */
+    public function adminVerifyUser(int $userId, int $adminId): bool {
+        if (!user_can($adminId, 'manage_options')) {
+            throw new Exception('Unauthorized');
+        }
+
+        // Check if already verified
+        if ($this->isVerified($userId)) {
+            return false;
+        }
+
+        // Update user_info directly
+        $result = $this->userInfoRepo->updateVerificationStatus($userId, true);
+        
+        if ($result) {
+            AuditLogger::log('admin_verified_user', $userId, [
+                'admin_id' => $adminId
+            ], 'user');
+        }
+
+        return $result;
+    }
+
+    /**
+     * Get users with pending verification
+     */
+    public function getPendingVerifications(int $limit = 100): array {
+        return $this->repo->getUnverifiedUsers($limit);
     }
 
     /**

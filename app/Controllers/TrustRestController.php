@@ -5,7 +5,7 @@
  * Handles all REST API endpoints with PageScore value objects
  * 
  * @package BCCTrust\Controllers
- * @version 2.0.0
+ * @version 2.1.0
  */
 
 namespace BCCTrust\Controllers;
@@ -19,8 +19,12 @@ use BCCTrust\Services\VoteService;
 use BCCTrust\Services\EndorsementService;
 use BCCTrust\Services\VerificationService;
 use BCCTrust\Repositories\ScoreRepository;
+use BCCTrust\Repositories\UserInfoRepository;
+use BCCTrust\Repositories\VoteRepository;
+use BCCTrust\Repositories\EndorsementRepository;
 use BCCTrust\Security\DeviceFingerprinter;
 use BCCTrust\Security\AuditLogger;
+use BCCTrust\Security\FraudDetector;
 use BCCTrust\ValueObjects\PageScore;
 
 if (!defined('ABSPATH')) {
@@ -30,6 +34,10 @@ if (!defined('ABSPATH')) {
 class TrustRestController {
 
     public static function register_routes() {
+        // ======================================================
+        // PUBLIC ENDPOINTS (for frontend)
+        // ======================================================
+        
         // Vote endpoints
         register_rest_route('bcc-trust/v1', '/vote', [
             'methods'  => 'POST',
@@ -102,10 +110,74 @@ class TrustRestController {
             'callback' => [self::class, 'report_vote'],
             'permission_callback' => [self::class, 'permission_check']
         ]);
+
+        // ======================================================
+        // ADMIN ENDPOINTS (for admin.js)
+        // ======================================================
+        
+        // Fraud statistics
+        register_rest_route('bcc-trust/v1', '/fraud/stats', [
+            'methods'  => 'GET',
+            'callback' => [self::class, 'get_fraud_stats'],
+            'permission_callback' => [self::class, 'admin_permission_check']
+        ]);
+
+        // High risk users
+        register_rest_route('bcc-trust/v1', '/users/high-risk', [
+            'methods'  => 'GET',
+            'callback' => [self::class, 'get_high_risk_users'],
+            'permission_callback' => [self::class, 'admin_permission_check']
+        ]);
+
+        // Fraud activity
+        register_rest_route('bcc-trust/v1', '/activity/fraud', [
+            'methods'  => 'GET',
+            'callback' => [self::class, 'get_fraud_activity'],
+            'permission_callback' => [self::class, 'admin_permission_check']
+        ]);
+
+        // Trust score trend
+        register_rest_route('bcc-trust/v1', '/stats/trust-trend', [
+            'methods'  => 'GET',
+            'callback' => [self::class, 'get_trust_trend'],
+            'permission_callback' => [self::class, 'admin_permission_check']
+        ]);
+
+        // Risk distribution
+        register_rest_route('bcc-trust/v1', '/stats/risk-distribution', [
+            'methods'  => 'GET',
+            'callback' => [self::class, 'get_risk_distribution'],
+            'permission_callback' => [self::class, 'admin_permission_check']
+        ]);
+
+        // Fraud trend
+        register_rest_route('bcc-trust/v1', '/stats/fraud-trend', [
+            'methods'  => 'GET',
+            'callback' => [self::class, 'get_fraud_trend'],
+            'permission_callback' => [self::class, 'admin_permission_check']
+        ]);
+
+        // Device statistics
+        register_rest_route('bcc-trust/v1', '/stats/devices', [
+            'methods'  => 'GET',
+            'callback' => [self::class, 'get_device_stats'],
+            'permission_callback' => [self::class, 'admin_permission_check']
+        ]);
+
+        // Analyze user
+        register_rest_route('bcc-trust/v1', '/analyze-user/(?P<id>\d+)', [
+            'methods'  => 'POST',
+            'callback' => [self::class, 'analyze_user'],
+            'permission_callback' => [self::class, 'admin_permission_check']
+        ]);
     }
 
     public static function permission_check(): bool {
         return is_user_logged_in();
+    }
+
+    public static function admin_permission_check(): bool {
+        return current_user_can('manage_options');
     }
 
     /**
@@ -136,7 +208,6 @@ class TrustRestController {
 
             $result = (new VoteService())->castPageVote($pageId, $voteType, $fingerprintData);
 
-            // Result already contains properly formatted score from PageScore::toApiResponse()
             return self::success($result);
 
         } catch (Exception $e) {
@@ -256,7 +327,8 @@ class TrustRestController {
                 'status' => 'Average',
                 'has_sufficient_data' => false,
                 'voter_diversity' => 0,
-                'net_score' => 0
+                'net_score' => 0,
+                'has_fraud_alerts' => false
             ]);
         }
 
@@ -267,8 +339,10 @@ class TrustRestController {
             $endorsement_count = $endorseService->getPageEndorsementCount($pageId);
         }
 
-        // Get current user's vote if logged in
+        // Get current user's vote and endorsement if logged in
         $userVote = null;
+        $userEndorsed = false;
+        
         if (is_user_logged_in()) {
             $voteService = new VoteService();
             $userVoteObj = $voteService->getUserPageVote($pageId);
@@ -279,13 +353,23 @@ class TrustRestController {
                     'created_at' => $userVoteObj->created_at
                 ];
             }
+            
+            $endorseService = new EndorsementService();
+            $userEndorsed = $endorseService->hasEndorsedPage($pageId, get_current_user_id());
         }
+
+        // Get page owner fraud data
+        $userInfoRepo = new UserInfoRepository();
+        $ownerInfo = $userInfoRepo->getByUserId($score->getPageOwnerId());
 
         $apiResponse = $score->toApiResponse();
         $apiResponse['page_title'] = get_the_title($pageId);
         $apiResponse['owner_id'] = $score->getPageOwnerId();
+        $apiResponse['owner_name'] = get_the_author_meta('display_name', $score->getPageOwnerId());
+        $apiResponse['owner_fraud_score'] = $ownerInfo ? $ownerInfo->fraud_score : 0;
         $apiResponse['endorsement_count'] = $endorsement_count;
         $apiResponse['user_vote'] = $userVote;
+        $apiResponse['user_endorsed'] = $userEndorsed;
         $apiResponse['last_calculated_at'] = $score->getLastCalculatedAt()->format('Y-m-d H:i:s');
 
         return self::success($apiResponse);
@@ -308,7 +392,8 @@ class TrustRestController {
                 'total_score' => $page->getTotalScore(),
                 'reputation_tier' => $page->getReputationTier(),
                 'vote_count' => $page->getVoteCount(),
-                'confidence_score' => $page->getConfidenceScore()
+                'confidence_score' => $page->getConfidenceScore(),
+                'has_fraud_alerts' => $page->hasFraudAlerts()
             ];
         }
 
@@ -352,7 +437,8 @@ class TrustRestController {
                     'reputation_tier' => $page->getReputationTier(),
                     'vote_count' => $page->getVoteCount(),
                     'endorsement_count' => $page->getEndorsementCount(),
-                    'confidence_score' => $page->getConfidenceScore()
+                    'confidence_score' => $page->getConfidenceScore(),
+                    'has_fraud_alerts' => $page->hasFraudAlerts()
                 ];
             }
 
@@ -437,9 +523,17 @@ class TrustRestController {
                     'signals' => $automationData['signals']
                 ], 'user');
                 
-                $currentFraud = (int) get_user_meta($userId, 'bcc_trust_fraud_score', true);
-                $newFraud = min(100, $currentFraud + 20);
-                update_user_meta($userId, 'bcc_trust_fraud_score', $newFraud);
+                // Update user_info table
+                global $wpdb;
+                $userInfoTable = bcc_trust_user_info_table();
+                
+                $wpdb->query($wpdb->prepare(
+                    "UPDATE {$userInfoTable} 
+                     SET automation_score = automation_score + 20,
+                         fraud_score = LEAST(100, fraud_score + 20)
+                     WHERE user_id = %d",
+                    $userId
+                ));
                 
                 $alert = true;
             }
@@ -468,7 +562,7 @@ class TrustRestController {
     }
 
     /**
-     * Get user's fraud/trust status
+     * Get user's fraud/trust status from user_info table
      */
     public static function get_user_status(WP_REST_Request $request) {
         try {
@@ -477,11 +571,18 @@ class TrustRestController {
                 throw new Exception('User not authenticated');
             }
             
-            $fingerprinter = new DeviceFingerprinter();
-            
             global $wpdb;
-            $fingerprintTable = $wpdb->prefix . 'bcc_trust_device_fingerprints';
             
+            // Get user info from user_info table
+            $userInfoTable = bcc_trust_user_info_table();
+            $fingerprintTable = bcc_trust_fingerprints_table();
+            
+            $userInfo = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$userInfoTable} WHERE user_id = %d",
+                $userId
+            ));
+            
+            // Get fingerprints
             $fingerprints = $wpdb->get_results($wpdb->prepare(
                 "SELECT * FROM {$fingerprintTable} 
                  WHERE user_id = %d 
@@ -490,29 +591,21 @@ class TrustRestController {
                 $userId
             ));
             
-            $fraudScore = (int) get_user_meta($userId, 'bcc_trust_fraud_score', true);
-            
-            $voteWeight = (float) get_user_meta($userId, 'bcc_trust_vote_weight', true);
-            if (!$voteWeight) {
-                $voteWeight = 1.0;
-            }
-            
-            $suspended = (bool) get_user_meta($userId, 'bcc_trust_suspended', true);
-            
-            $verified = (bool) get_user_meta($userId, 'bcc_trust_email_verified', true);
-            
-            $voteCount = (int) get_user_meta($userId, 'bcc_trust_votes_cast', true);
-            $endorsementCount = (int) get_user_meta($userId, 'bcc_trust_endorsements_given', true);
-            
             return self::success([
                 'user_id' => $userId,
-                'fraud_score' => $fraudScore,
-                'vote_weight' => $voteWeight,
-                'suspended' => $suspended,
-                'verified' => $verified,
+                'fraud_score' => $userInfo ? (int)$userInfo->fraud_score : 0,
+                'automation_score' => $userInfo ? (int)$userInfo->automation_score : 0,
+                'behavior_score' => $userInfo ? (int)$userInfo->behavior_score : 0,
+                'risk_level' => $userInfo ? $userInfo->risk_level : 'unknown',
+                'suspended' => $userInfo ? (bool)$userInfo->is_suspended : false,
+                'verified' => $userInfo ? (bool)$userInfo->is_verified : false,
                 'stats' => [
-                    'votes_cast' => $voteCount,
-                    'endorsements_given' => $endorsementCount
+                    'votes_cast' => $userInfo ? (int)$userInfo->votes_cast : 0,
+                    'endorsements_given' => $userInfo ? (int)$userInfo->endorsements_given : 0,
+                    'pages_owned' => $userInfo ? (int)$userInfo->pages_owned : 0,
+                    'pages_joined' => $userInfo ? (int)$userInfo->pages_joined : 0,
+                    'posts_created' => $userInfo ? (int)$userInfo->posts_created : 0,
+                    'comments_made' => $userInfo ? (int)$userInfo->comments_made : 0
                 ],
                 'fingerprints' => array_map(function($fp) {
                     return [
@@ -530,6 +623,9 @@ class TrustRestController {
         }
     }
 
+    /**
+     * Report a vote
+     */
     public static function report_vote(WP_REST_Request $request) {
         try {
             $userId = get_current_user_id();
@@ -549,7 +645,7 @@ class TrustRestController {
             }
             
             global $wpdb;
-            $votesTable = $wpdb->prefix . 'bcc_trust_votes';
+            $votesTable = bcc_trust_votes_table();
             
             $vote = $wpdb->get_row($wpdb->prepare(
                 "SELECT * FROM {$votesTable} WHERE id = %d",
@@ -560,7 +656,7 @@ class TrustRestController {
                 throw new Exception('Vote not found');
             }
             
-            $flagsTable = $wpdb->prefix . 'bcc_trust_flags';
+            $flagsTable = bcc_trust_flags_table();
             $existing = $wpdb->get_var($wpdb->prepare(
                 "SELECT COUNT(*) FROM {$flagsTable} 
                  WHERE vote_id = %d AND flagger_user_id = %d",
@@ -603,9 +699,9 @@ class TrustRestController {
                     ['%d']
                 );
                 
-                if (class_exists('BCC_Page_Score_Calculator')) {
-                    $calculator = new \BCC_Page_Score_Calculator();
-                    $calculator->recalculate_page_score($vote->page_id);
+                // Recalculate page score
+                if (function_exists('bcc_trust_recalculate_page_score')) {
+                    bcc_trust_recalculate_page_score($vote->page_id);
                 }
             }
             
@@ -621,7 +717,233 @@ class TrustRestController {
         }
     }
 
-   
+    // ======================================================
+    // ADMIN ENDPOINTS
+    // ======================================================
+
+    /**
+     * Get fraud statistics
+     */
+    public static function get_fraud_stats(WP_REST_Request $request) {
+        try {
+            $stats = FraudDetector::getStats();
+            
+            // Add additional stats
+            $userInfoRepo = new UserInfoRepository();
+            $deviceStats = DeviceFingerprinter::getStats();
+            
+            return self::success(array_merge($stats, [
+                'device_stats' => $deviceStats,
+                'total_alerts' => $stats['suspended_users'] ?? 0,
+                'high_risk_count' => $stats['risk_distribution']['high'] ?? 0,
+                'suspended_count' => $stats['suspended_users'] ?? 0
+            ]));
+            
+        } catch (Exception $e) {
+            return self::error($e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Get high risk users
+     */
+    public static function get_high_risk_users(WP_REST_Request $request) {
+        try {
+            $limit = (int) $request->get_param('limit') ?: 20;
+            $threshold = (int) $request->get_param('threshold') ?: 70;
+            
+            $userInfoRepo = new UserInfoRepository();
+            $users = $userInfoRepo->getHighRiskUsers($threshold, $limit);
+            
+            return self::success($users);
+            
+        } catch (Exception $e) {
+            return self::error($e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Get fraud activity
+     */
+    public static function get_fraud_activity(WP_REST_Request $request) {
+        try {
+            $limit = (int) $request->get_param('limit') ?: 10;
+            
+            $activity = AuditLogger::getSuspiciousActivity(24, $limit);
+            
+            $formatted = [];
+            foreach ($activity as $event) {
+                $formatted[] = [
+                    'id' => $event->id,
+                    'user_id' => $event->user_id,
+                    'action' => $event->action,
+                    'message' => $event->action,
+                    'time' => bcc_trust_time_ago($event->created_at),
+                    'severity' => self::getSeverityFromAction($event->action)
+                ];
+            }
+            
+            return self::success($formatted);
+            
+        } catch (Exception $e) {
+            return self::error($e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Get trust score trend
+     */
+    public static function get_trust_trend(WP_REST_Request $request) {
+        try {
+            $days = (int) $request->get_param('days') ?: 30;
+            
+            global $wpdb;
+            $scoresTable = bcc_trust_scores_table();
+            
+            // Get daily average scores for last N days
+            $results = $wpdb->get_results($wpdb->prepare("
+                SELECT 
+                    DATE(last_calculated_at) as date,
+                    AVG(total_score) as avg_score
+                FROM {$scoresTable}
+                WHERE last_calculated_at > DATE_SUB(NOW(), INTERVAL %d DAY)
+                GROUP BY DATE(last_calculated_at)
+                ORDER BY date ASC
+            ", $days));
+            
+            $labels = [];
+            $scores = [];
+            
+            foreach ($results as $row) {
+                $labels[] = date('M d', strtotime($row->date));
+                $scores[] = round($row->avg_score, 1);
+            }
+            
+            return self::success([
+                'labels' => $labels,
+                'scores' => $scores
+            ]);
+            
+        } catch (Exception $e) {
+            return self::error($e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Get risk distribution
+     */
+    public static function get_risk_distribution(WP_REST_Request $request) {
+        try {
+            $stats = FraudDetector::getStats();
+            
+            return self::success([
+                'critical' => $stats['risk_distribution']['critical'] ?? 0,
+                'high' => $stats['risk_distribution']['high'] ?? 0,
+                'medium' => $stats['risk_distribution']['medium'] ?? 0,
+                'low' => $stats['risk_distribution']['low'] ?? 0,
+                'minimal' => $stats['risk_distribution']['minimal'] ?? 0
+            ]);
+            
+        } catch (Exception $e) {
+            return self::error($e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Get fraud trend
+     */
+    public static function get_fraud_trend(WP_REST_Request $request) {
+        try {
+            $days = (int) $request->get_param('days') ?: 30;
+            
+            global $wpdb;
+            $activityTable = bcc_trust_activity_table();
+            
+            // Get daily fraud detection counts
+            $results = $wpdb->get_results($wpdb->prepare("
+                SELECT 
+                    DATE(created_at) as date,
+                    COUNT(*) as count
+                FROM {$activityTable}
+                WHERE action LIKE '%fraud%' 
+                   OR action LIKE '%suspicious%'
+                   OR action LIKE '%flag%'
+                AND created_at > DATE_SUB(NOW(), INTERVAL %d DAY)
+                GROUP BY DATE(created_at)
+                ORDER BY date ASC
+            ", $days));
+            
+            $labels = [];
+            $counts = [];
+            
+            foreach ($results as $row) {
+                $labels[] = date('M d', strtotime($row->date));
+                $counts[] = $row->count;
+            }
+            
+            return self::success([
+                'labels' => $labels,
+                'counts' => $counts
+            ]);
+            
+        } catch (Exception $e) {
+            return self::error($e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Get device statistics
+     */
+    public static function get_device_stats(WP_REST_Request $request) {
+        try {
+            $stats = DeviceFingerprinter::getStats();
+            
+            return self::success([
+                'clean' => $stats['total_records'] - $stats['automated_detected'] - $stats['high_risk'],
+                'suspicious' => $stats['medium_risk'] ?? 0,
+                'automated' => $stats['automated_detected'],
+                'shared' => $stats['shared_devices']
+            ]);
+            
+        } catch (Exception $e) {
+            return self::error($e->getMessage(), 500);
+        }
+    }
+
+    /**
+     * Analyze a user
+     */
+    public static function analyze_user(WP_REST_Request $request) {
+        try {
+            $userId = (int) $request['id'];
+            
+            if (!$userId) {
+                throw new Exception('User ID required');
+            }
+            
+            // Run comprehensive fraud analysis
+            $analysis = FraudDetector::analyzeFraud($userId);
+            
+            // Update fraud score
+            FraudDetector::updateFraudScore($userId);
+            
+            return self::success([
+                'user_id' => $userId,
+                'fraud_score' => $analysis['score'],
+                'risk_level' => $analysis['risk_level'],
+                'triggers' => $analysis['triggers'],
+                'analysis' => $analysis
+            ]);
+            
+        } catch (Exception $e) {
+            return self::error($e->getMessage(), 500);
+        }
+    }
+
+    // ======================================================
+    // HELPER METHODS
+    // ======================================================
+
     private static function get_peepso_page_data($pageId) {
         global $wpdb;
         
@@ -656,7 +978,19 @@ class TrustRestController {
         return null;
     }
 
-   
+    private static function getSeverityFromAction($action) {
+        if (strpos($action, 'critical') !== false || strpos($action, 'suspend') !== false) {
+            return 'critical';
+        }
+        if (strpos($action, 'high') !== false || strpos($action, 'ring') !== false) {
+            return 'high';
+        }
+        if (strpos($action, 'medium') !== false || strpos($action, 'flag') !== false) {
+            return 'medium';
+        }
+        return 'low';
+    }
+
     private static function success(array $data): WP_REST_Response {
         return new WP_REST_Response([
             'success' => true,
@@ -664,7 +998,6 @@ class TrustRestController {
         ], 200);
     }
 
-    
     private static function error(string $message, int $status): WP_Error {
         return new WP_Error('trust_error', $message, ['status' => $status]);
     }

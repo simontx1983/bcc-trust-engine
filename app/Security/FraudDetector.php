@@ -5,6 +5,10 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+use BCCTrust\Repositories\UserInfoRepository;
+use BCCTrust\Repositories\VerificationRepository;
+use BCCTrust\Repositories\FraudAnalysisRepository;
+
 class FraudDetector {
     
     /**
@@ -12,6 +16,36 @@ class FraudDetector {
      */
     const CACHE_GROUP = 'bcc_fraud';
     const CACHE_TTL = 300; // 5 minutes
+
+    /**
+     * @var UserInfoRepository
+     */
+    private static $userInfoRepo;
+
+    /**
+     * @var VerificationRepository
+     */
+    private static $verificationRepo;
+
+    /**
+     * @var FraudAnalysisRepository
+     */
+    private static $fraudAnalysisRepo;
+
+    /**
+     * Initialize repositories
+     */
+    private static function initRepositories(): void {
+        if (!self::$userInfoRepo) {
+            self::$userInfoRepo = new UserInfoRepository();
+        }
+        if (!self::$verificationRepo) {
+            self::$verificationRepo = new VerificationRepository();
+        }
+        if (!self::$fraudAnalysisRepo && class_exists('\\BCCTrust\\Repositories\\FraudAnalysisRepository')) {
+            self::$fraudAnalysisRepo = new FraudAnalysisRepository();
+        }
+    }
 
     /**
      * Detect rapid voting (more than 20 votes in 2 minutes)
@@ -171,7 +205,7 @@ class FraudDetector {
 
     /**
      * ======================================================
-     * NEW: Enhanced fraud detection using new systems
+     * ENHANCED FRAUD DETECTION USING NEW SYSTEMS
      * ======================================================
      */
 
@@ -182,11 +216,16 @@ class FraudDetector {
      * @return array Complete fraud analysis
      */
     public static function analyzeFraud(int $userId): array {
+        self::initRepositories();
+
         // Check cache first
         $cached = wp_cache_get('fraud_analysis_' . $userId, self::CACHE_GROUP);
         if ($cached !== false) {
             return $cached;
         }
+
+        // Get user info from user_info table
+        $userInfo = self::$userInfoRepo->getByUserId($userId);
 
         $results = [
             'triggers' => [],
@@ -291,9 +330,14 @@ class FraudDetector {
         // ======================================================
         
         $trustGraph = new TrustGraph();
-        $trustRank = (float) get_user_meta($userId, 'bcc_trust_graph_rank', true);
+        
+        // Get trust rank from user_info table
+        $trustRank = $userInfo ? (float) $userInfo->trust_rank : 0;
         if (!$trustRank) {
             $trustRank = $trustGraph->calculateTrustRank($userId);
+            if ($userInfo) {
+                self::$userInfoRepo->updateTrustRank($userId, $trustRank);
+            }
         }
         
         $results['details']['trust_rank'] = $trustRank;
@@ -320,34 +364,35 @@ class FraudDetector {
         }
 
         // ======================================================
-        // 5. Account age and verification status
+        // 5. Account age and verification status from user_info
         // ======================================================
         
-        $user = get_userdata($userId);
-        if ($user) {
-            $accountAge = time() - strtotime($user->user_registered);
-            $accountDays = $accountAge / (24 * 3600);
-            
-            $results['details']['account_days'] = round($accountDays, 1);
-            
-            // Very new accounts are higher risk
-            if ($accountDays < 1) {
-                $results['triggers'][] = 'brand_new_account';
-                $results['score'] += 20;
-            } elseif ($accountDays < 7) {
-                $results['triggers'][] = 'new_account';
-                $results['score'] += 10;
+        if ($userInfo) {
+            $user = get_userdata($userId);
+            if ($user) {
+                $accountAge = time() - strtotime($user->user_registered);
+                $accountDays = $accountAge / (24 * 3600);
+                
+                $results['details']['account_days'] = round($accountDays, 1);
+                
+                // Very new accounts are higher risk
+                if ($accountDays < 1) {
+                    $results['triggers'][] = 'brand_new_account';
+                    $results['score'] += 20;
+                } elseif ($accountDays < 7) {
+                    $results['triggers'][] = 'new_account';
+                    $results['score'] += 10;
+                }
             }
-        }
 
-        // Email verification
-        $verificationRepo = new \BCCTrust\Repositories\VerificationRepository();
-        if (!$verificationRepo->isVerified($userId)) {
-            $results['triggers'][] = 'unverified_email';
-            $results['score'] += 15;
-            $results['details']['email_verified'] = false;
-        } else {
-            $results['details']['email_verified'] = true;
+            // Email verification from user_info
+            if (!$userInfo->is_verified) {
+                $results['triggers'][] = 'unverified_email';
+                $results['score'] += 15;
+                $results['details']['email_verified'] = false;
+            } else {
+                $results['details']['email_verified'] = true;
+            }
         }
 
         // ======================================================
@@ -385,13 +430,16 @@ class FraudDetector {
     }
 
     /**
-     * Enhanced fraud score calculation using all systems
+     * Enhanced fraud score calculation using all systems and user_info table
      */
     public static function getEnhancedFraudScore(int $userId): int {
+        self::initRepositories();
+        
         $analysis = self::analyzeFraud($userId);
         
-        // Get existing fraud score
-        $existingScore = (int) get_user_meta($userId, 'bcc_trust_fraud_score', true);
+        // Get existing fraud score from user_info
+        $userInfo = self::$userInfoRepo->getByUserId($userId);
+        $existingScore = $userInfo ? (int) $userInfo->fraud_score : 0;
         
         // Blend with new analysis (70% new, 30% existing to smooth changes)
         $newScore = (int) round(($analysis['score'] * 0.7) + ($existingScore * 0.3));
@@ -399,10 +447,24 @@ class FraudDetector {
         // Cap at 100
         $newScore = min(100, max(0, $newScore));
         
-        // Update user meta with enhanced score
-        update_user_meta($userId, 'bcc_trust_fraud_score', $newScore);
-        update_user_meta($userId, 'bcc_trust_fraud_analysis', $analysis);
-        update_user_meta($userId, 'bcc_trust_fraud_updated', time());
+        // Update user_info table
+        self::$userInfoRepo->updateFraudScore($userId, $newScore);
+        
+        // Store analysis results in the new fraud_analysis table
+        if (self::$fraudAnalysisRepo) {
+            // Set expiration to 90 days from now
+            $expiresAt = date('Y-m-d H:i:s', strtotime('+90 days'));
+            
+            self::$fraudAnalysisRepo->storeAnalysis(
+                $userId,
+                $newScore,
+                $analysis['risk_level'],
+                $analysis['confidence'],
+                $analysis['triggers'],
+                $analysis['details'],
+                $expiresAt
+            );
+        }
         
         return $newScore;
     }
@@ -411,7 +473,10 @@ class FraudDetector {
      * Check if user should be auto-suspended
      */
     public static function shouldSuspend(int $userId): bool {
+        self::initRepositories();
+        
         $analysis = self::analyzeFraud($userId);
+        $userInfo = self::$userInfoRepo->getByUserId($userId);
         
         // Auto-suspend conditions
         if ($analysis['score'] >= 85) {
@@ -448,7 +513,10 @@ class FraudDetector {
      * Get fraud analysis summary for dashboard
      */
     public static function getFraudSummary(int $userId): array {
+        self::initRepositories();
+        
         $analysis = self::analyzeFraud($userId);
+        $userInfo = self::$userInfoRepo->getByUserId($userId);
         
         return [
             'user_id' => $userId,
@@ -457,8 +525,8 @@ class FraudDetector {
             'confidence' => round($analysis['confidence'] * 100, 1) . '%',
             'triggers' => $analysis['triggers'],
             'top_concerns' => array_slice($analysis['triggers'], 0, 5),
-            'last_updated' => get_user_meta($userId, 'bcc_trust_fraud_updated', true) ?: 'never',
-            'suspended' => self::isSuspended($userId)
+            'last_updated' => $userInfo ? $userInfo->last_calculated_at : 'never',
+            'suspended' => $userInfo ? (bool) $userInfo->is_suspended : false
         ];
     }
 
@@ -466,17 +534,21 @@ class FraudDetector {
      * Check if user is suspended
      */
     public static function isSuspended(int $userId): bool {
-        return (bool) get_user_meta($userId, 'bcc_trust_suspended', true);
+        self::initRepositories();
+        $userInfo = self::$userInfoRepo->getByUserId($userId);
+        return $userInfo ? (bool) $userInfo->is_suspended : false;
     }
 
     /**
      * Get original fraud score (legacy method)
      */
     public static function getFraudScore(int $userId): int {
+        self::initRepositories();
+        
         // Try to get enhanced score first
-        $enhanced = (int) get_user_meta($userId, 'bcc_trust_fraud_score', true);
-        if ($enhanced > 0) {
-            return $enhanced;
+        $userInfo = self::$userInfoRepo->getByUserId($userId);
+        if ($userInfo && $userInfo->fraud_score > 0) {
+            return $userInfo->fraud_score;
         }
         
         // Fall back to legacy calculation
@@ -510,7 +582,7 @@ class FraudDetector {
         }
 
         // Log high fraud scores
-        if ($score > 50) {
+        if ($score > 50 && class_exists('\\BCCTrust\\Security\\AuditLogger')) {
             AuditLogger::log('fraud_detected', $userId, [
                 'score' => $score,
                 'reasons' => $reasons
@@ -521,9 +593,11 @@ class FraudDetector {
     }
 
     /**
-     * Update fraud score in user meta (enhanced version)
+     * Update fraud score in user_info table
      */
     public static function updateFraudScore(int $userId): void {
+        self::initRepositories();
+        
         $score = self::getEnhancedFraudScore($userId);
         
         // Auto-suspend if score too high
@@ -532,49 +606,48 @@ class FraudDetector {
         }
         
         // Log significant changes
-        $oldScore = (int) get_user_meta($userId, 'bcc_trust_previous_fraud_score', true);
-        if (abs($score - $oldScore) > 20) {
-            AuditLogger::log('fraud_score_significant_change', $userId, [
-                'old_score' => $oldScore,
-                'new_score' => $score,
-                'analysis' => get_user_meta($userId, 'bcc_trust_fraud_analysis', true)
-            ], 'user');
-        }
+        $userInfo = self::$userInfoRepo->getByUserId($userId);
+        $oldScore = $userInfo ? (int) $userInfo->fraud_score : 0;
         
-        update_user_meta($userId, 'bcc_trust_previous_fraud_score', $oldScore ?: $score);
+        if (abs($score - $oldScore) > 20) {
+            if (class_exists('\\BCCTrust\\Security\\AuditLogger')) {
+                AuditLogger::log('fraud_score_significant_change', $userId, [
+                    'old_score' => $oldScore,
+                    'new_score' => $score
+                ], 'user');
+            }
+        }
     }
 
     /**
      * Suspend a user with reason
      */
     public static function suspendUser(int $userId, string $reason, int $fraudScore = null): void {
-        update_user_meta($userId, 'bcc_trust_suspended', true);
-        update_user_meta($userId, 'bcc_trust_suspended_at', current_time('mysql'));
-        update_user_meta($userId, 'bcc_trust_suspended_reason', $reason);
-        update_user_meta($userId, 'bcc_trust_suspended_by', 0); // 0 = system
+        self::initRepositories();
         
-        if ($fraudScore) {
-            update_user_meta($userId, 'bcc_trust_suspended_fraud_score', $fraudScore);
+        // Update user_info table
+        self::$userInfoRepo->suspendUser($userId, $reason);
+        
+        if (class_exists('\\BCCTrust\\Security\\AuditLogger')) {
+            AuditLogger::log('user_suspended', $userId, [
+                'reason' => $reason,
+                'fraud_score' => $fraudScore
+            ], 'user');
         }
-        
-        AuditLogger::log('user_suspended', $userId, [
-            'reason' => $reason,
-            'fraud_score' => $fraudScore,
-            'analysis' => get_user_meta($userId, 'bcc_trust_fraud_analysis', true)
-        ], 'user');
     }
 
     /**
      * Unsuspend a user
      */
     public static function unsuspendUser(int $userId): void {
-        delete_user_meta($userId, 'bcc_trust_suspended');
-        delete_user_meta($userId, 'bcc_trust_suspended_at');
-        delete_user_meta($userId, 'bcc_trust_suspended_reason');
-        delete_user_meta($userId, 'bcc_trust_suspended_by');
-        delete_user_meta($userId, 'bcc_trust_suspended_fraud_score');
+        self::initRepositories();
         
-        AuditLogger::log('user_unsuspended', $userId, [], 'user');
+        // Update user_info table
+        self::$userInfoRepo->unsuspendUser($userId);
+        
+        if (class_exists('\\BCCTrust\\Security\\AuditLogger')) {
+            AuditLogger::log('user_unsuspended', $userId, [], 'user');
+        }
     }
 
     /**
@@ -606,97 +679,86 @@ class FraudDetector {
      * Get suspicious users with enhanced filtering
      */
     public static function getSuspiciousUsers(int $threshold = 50, int $limit = 100): array {
+        self::initRepositories();
+        
+        // Query user_info table for high fraud scores
         global $wpdb;
+        $userInfoTable = bcc_trust_user_info_table();
+        
+        $results = $wpdb->get_results($wpdb->prepare("
+            SELECT ui.*, u.display_name, u.user_email, u.user_registered
+            FROM {$userInfoTable} ui
+            JOIN {$wpdb->users} u ON ui.user_id = u.ID
+            WHERE ui.fraud_score >= %d
+            ORDER BY ui.fraud_score DESC
+            LIMIT %d
+        ", $threshold, $limit));
 
-        $users = get_users([
-            'meta_key' => 'bcc_trust_fraud_score',
-            'meta_value' => $threshold,
-            'meta_compare' => '>=',
-            'number' => $limit,
-            'fields' => ['ID', 'user_email', 'display_name', 'user_registered']
-        ]);
-
-        $result = [];
-        foreach ($users as $user) {
-            $analysis = get_user_meta($user->ID, 'bcc_trust_fraud_analysis', true);
-            
-            $result[] = [
-                'id' => $user->ID,
-                'email' => $user->user_email,
-                'name' => $user->display_name,
-                'registered' => $user->user_registered,
-                'fraud_score' => (int) get_user_meta($user->ID, 'bcc_trust_fraud_score', true),
-                'risk_level' => $analysis['risk_level'] ?? 'unknown',
-                'triggers' => $analysis['triggers'] ?? [],
-                'confidence' => isset($analysis['confidence']) ? round($analysis['confidence'] * 100, 1) . '%' : 'unknown',
-                'suspended' => self::isSuspended($user->ID)
+        $suspicious = [];
+        foreach ($results as $row) {
+            $suspicious[] = [
+                'id' => $row->user_id,
+                'email' => $row->user_email,
+                'name' => $row->display_name,
+                'registered' => $row->user_registered,
+                'fraud_score' => (int) $row->fraud_score,
+                'risk_level' => $row->risk_level,
+                'automation_score' => $row->automation_score,
+                'behavior_score' => $row->behavior_score,
+                'suspended' => (bool) $row->is_suspended
             ];
         }
 
-        // Sort by fraud score descending
-        usort($result, function($a, $b) {
-            return $b['fraud_score'] <=> $a['fraud_score'];
-        });
-
-        return $result;
+        return $suspicious;
     }
 
     /**
-     * Get fraud statistics for dashboard
+     * Get fraud statistics for dashboard from user_info table
      */
     public static function getStats(): array {
         global $wpdb;
         
-        $totalUsers = count_users();
-        $total = $totalUsers['total_users'];
+        $userInfoTable = bcc_trust_user_info_table();
         
-        $usersWithScores = $wpdb->get_var("
-            SELECT COUNT(*) FROM {$wpdb->usermeta}
-            WHERE meta_key = 'bcc_trust_fraud_score'
+        $stats = $wpdb->get_row("
+            SELECT 
+                COUNT(*) as total_users,
+                AVG(fraud_score) as avg_fraud_score,
+                SUM(CASE WHEN fraud_score >= 80 THEN 1 ELSE 0 END) as critical_risk,
+                SUM(CASE WHEN fraud_score BETWEEN 60 AND 79 THEN 1 ELSE 0 END) as high_risk,
+                SUM(CASE WHEN fraud_score BETWEEN 40 AND 59 THEN 1 ELSE 0 END) as medium_risk,
+                SUM(CASE WHEN fraud_score BETWEEN 20 AND 39 THEN 1 ELSE 0 END) as low_risk,
+                SUM(CASE WHEN fraud_score < 20 THEN 1 ELSE 0 END) as minimal_risk,
+                SUM(CASE WHEN is_suspended = 1 THEN 1 ELSE 0 END) as suspended_users
+            FROM {$userInfoTable}
         ");
-        
-        $avgScore = $wpdb->get_var("
-            SELECT AVG(CAST(meta_value AS UNSIGNED))
-            FROM {$wpdb->usermeta}
-            WHERE meta_key = 'bcc_trust_fraud_score'
-        ");
-        
-        $suspended = $wpdb->get_var("
-            SELECT COUNT(*) FROM {$wpdb->usermeta}
-            WHERE meta_key = 'bcc_trust_suspended'
-            AND meta_value = '1'
-        ");
-        
-        $riskLevels = [
-            'critical' => 0,
-            'high' => 0,
-            'medium' => 0,
-            'low' => 0,
-            'minimal' => 0
-        ];
-        
-        // Get risk level distribution
-        $users = get_users([
-            'meta_key' => 'bcc_trust_fraud_analysis',
-            'number' => 1000,
-            'fields' => ['ID']
-        ]);
-        
-        foreach ($users as $user) {
-            $analysis = get_user_meta($user->ID, 'bcc_trust_fraud_analysis', true);
-            if (isset($analysis['risk_level'])) {
-                $riskLevels[$analysis['risk_level']]++;
-            }
-        }
         
         return [
-            'total_users' => $total,
-            'users_with_scores' => (int) $usersWithScores,
-            'average_fraud_score' => round((float) $avgScore, 1),
-            'suspended_users' => (int) $suspended,
-            'risk_distribution' => $riskLevels,
+            'total_users' => (int) ($stats->total_users ?? 0),
+            'average_fraud_score' => round((float) ($stats->avg_fraud_score ?? 0), 1),
+            'risk_distribution' => [
+                'critical' => (int) ($stats->critical_risk ?? 0),
+                'high' => (int) ($stats->high_risk ?? 0),
+                'medium' => (int) ($stats->medium_risk ?? 0),
+                'low' => (int) ($stats->low_risk ?? 0),
+                'minimal' => (int) ($stats->minimal_risk ?? 0)
+            ],
+            'suspended_users' => (int) ($stats->suspended_users ?? 0),
             'last_updated' => current_time('mysql')
         ];
+    }
+
+    /**
+     * Get historical fraud analysis for a user
+     */
+    public static function getFraudHistory(int $userId, int $limit = 10): array {
+        self::initRepositories();
+        
+        if (!self::$fraudAnalysisRepo) {
+            return [];
+        }
+        
+        return self::$fraudAnalysisRepo->getHistoryForUser($userId, $limit);
     }
 
     /**
@@ -704,6 +766,5 @@ class FraudDetector {
      */
     public static function clearCache(int $userId): void {
         wp_cache_delete('fraud_analysis_' . $userId, self::CACHE_GROUP);
-        delete_user_meta($userId, 'bcc_trust_fraud_analysis');
     }
 }

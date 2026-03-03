@@ -32,12 +32,18 @@ class BCC_Page_Score_Calculator {
     private $endorseRepo;
     
     /**
+     * @var \BCCTrust\Repositories\UserInfoRepository
+     */
+    private $userInfoRepo;
+    
+    /**
      * Constructor
      */
     public function __construct() {
         $this->scoreRepo = new \BCCTrust\Repositories\ScoreRepository();
         $this->voteRepo = new \BCCTrust\Repositories\VoteRepository();
         $this->endorseRepo = new \BCCTrust\Repositories\EndorsementRepository();
+        $this->userInfoRepo = new \BCCTrust\Repositories\UserInfoRepository();
     }
     
     /**
@@ -67,7 +73,9 @@ class BCC_Page_Score_Calculator {
             'reputation_tier' => $score->getReputationTier(),
             'endorsement_count' => $score->getEndorsementCount(),
             'last_vote_at' => $score->getLastVoteAt() ? $score->getLastVoteAt()->format('Y-m-d H:i:s') : null,
-            'last_calculated_at' => $score->getLastCalculatedAt()->format('Y-m-d H:i:s')
+            'last_calculated_at' => $score->getLastCalculatedAt()->format('Y-m-d H:i:s'),
+            'has_fraud_alerts' => $score->hasFraudAlerts(),
+            'fraud_alert_count' => $score->getFraudAlertCount()
         ];
     }
     
@@ -217,7 +225,8 @@ class BCC_Page_Score_Calculator {
                 'unique_voters' => $score->getUniqueVoters(),
                 'confidence_score' => $score->getConfidenceScore(),
                 'reputation_tier' => $score->getReputationTier(),
-                'endorsement_count' => $score->getEndorsementCount()
+                'endorsement_count' => $score->getEndorsementCount(),
+                'has_fraud_alerts' => $score->hasFraudAlerts()
             ];
         }
         
@@ -250,7 +259,8 @@ class BCC_Page_Score_Calculator {
                 'unique_voters' => $page->getUniqueVoters(),
                 'confidence_score' => $page->getConfidenceScore(),
                 'reputation_tier' => $page->getReputationTier(),
-                'endorsement_count' => $page->getEndorsementCount()
+                'endorsement_count' => $page->getEndorsementCount(),
+                'has_fraud_alerts' => $page->hasFraudAlerts()
             ];
         }
         
@@ -258,7 +268,7 @@ class BCC_Page_Score_Calculator {
     }
     
     /**
-     * Get suspicious pages (legacy method)
+     * Get suspicious pages (legacy method) - FIXED to use user_info table
      * 
      * @param int $threshold
      * @return array
@@ -268,17 +278,17 @@ class BCC_Page_Score_Calculator {
         
         $scores_table = bcc_trust_scores_table();
         $votes_table = bcc_trust_votes_table();
+        $user_info_table = bcc_trust_user_info_table();
         
         return $wpdb->get_results($wpdb->prepare("
             SELECT s.*, 
                    (SELECT COUNT(*) FROM {$votes_table} v 
                     WHERE v.page_id = s.page_id 
                     AND v.status = 1) as vote_count,
-                   (SELECT COUNT(*) FROM {$wpdb->usermeta} um
-                    JOIN {$votes_table} v ON v.voter_user_id = um.user_id
+                   (SELECT COUNT(*) FROM {$user_info_table} ui
+                    JOIN {$votes_table} v ON v.voter_user_id = ui.user_id
                     WHERE v.page_id = s.page_id
-                    AND um.meta_key = 'bcc_trust_fraud_score'
-                    AND um.meta_value > %d) as suspicious_votes
+                    AND ui.fraud_score > %d) as suspicious_votes
             FROM {$scores_table} s
             HAVING suspicious_votes > 5
             ORDER BY suspicious_votes DESC

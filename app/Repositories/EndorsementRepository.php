@@ -19,16 +19,16 @@ class EndorsementRepository {
     private $behavioralAnalyzer;
     private $trustGraph;
     private $scoreRepo;
-    private $endorseRepo;
+    private $userInfoRepo;
 
     public function __construct() {
         global $wpdb;
-        $this->table = $wpdb->prefix . 'bcc_trust_endorsements';
+        $this->table = bcc_trust_endorsements_table();
         $this->fingerprinter = new DeviceFingerprinter();
         $this->behavioralAnalyzer = new BehavioralAnalyzer();
         $this->trustGraph = new TrustGraph();
         $this->scoreRepo = new ScoreRepository();
-        $this->endorseRepo = $this; // Self-reference for methods
+        $this->userInfoRepo = new UserInfoRepository();
     }
 
     /**
@@ -290,45 +290,49 @@ class EndorsementRepository {
     }
 
     /**
-     * Calculate base endorser weight
+     * Calculate base endorser weight using user_info table
      */
     private function calculateBaseEndorserWeight(int $userId): float {
         $weight = 1.0;
 
-        // Get user's own page scores
-        $userPages = $this->scoreRepo->getByOwnerId($userId);
+        // Get user info from user_info table
+        $userInfo = $this->userInfoRepo->getByUserId($userId);
         
-        if (!empty($userPages)) {
-            $totalScore = 0;
-            foreach ($userPages as $page) {
-                $totalScore += $page->total_score;
-            }
-            $avgScore = $totalScore / count($userPages);
+        if ($userInfo) {
+            // Get user's own page scores
+            $userPages = $this->scoreRepo->getByOwnerId($userId);
             
-            // Apply tier-based weight
-            if ($avgScore >= 80) {
-                $weight = defined('BCC_TRUST_ENDORSE_ELITE') ? BCC_TRUST_ENDORSE_ELITE : 2.0;
-            } elseif ($avgScore >= 65) {
-                $weight = defined('BCC_TRUST_ENDORSE_TRUSTED') ? BCC_TRUST_ENDORSE_TRUSTED : 1.5;
-            } elseif ($avgScore <= 35) {
-                $weight = defined('BCC_TRUST_ENDORSE_RISKY') ? BCC_TRUST_ENDORSE_RISKY : 0.3;
-            } elseif ($avgScore <= 45) {
-                $weight = defined('BCC_TRUST_ENDORSE_CAUTION') ? BCC_TRUST_ENDORSE_CAUTION : 0.6;
+            if (!empty($userPages)) {
+                $totalScore = 0;
+                foreach ($userPages as $page) {
+                    $totalScore += $page->getTotalScore();
+                }
+                $avgScore = $totalScore / count($userPages);
+                
+                // Apply tier-based weight
+                if ($avgScore >= 80) {
+                    $weight = defined('BCC_TRUST_ENDORSE_ELITE') ? BCC_TRUST_ENDORSE_ELITE : 2.0;
+                } elseif ($avgScore >= 65) {
+                    $weight = defined('BCC_TRUST_ENDORSE_TRUSTED') ? BCC_TRUST_ENDORSE_TRUSTED : 1.5;
+                } elseif ($avgScore <= 35) {
+                    $weight = defined('BCC_TRUST_ENDORSE_RISKY') ? BCC_TRUST_ENDORSE_RISKY : 0.3;
+                } elseif ($avgScore <= 45) {
+                    $weight = defined('BCC_TRUST_ENDORSE_CAUTION') ? BCC_TRUST_ENDORSE_CAUTION : 0.6;
+                }
+                
+                // Page count multiplier
+                $pageCount = count($userPages);
+                if ($pageCount >= 5) {
+                    $weight *= 1.2;
+                } elseif ($pageCount >= 2) {
+                    $weight *= 1.1;
+                }
             }
-            
-            // Page count multiplier
-            $pageCount = count($userPages);
-            if ($pageCount >= 5) {
-                $weight *= 1.2;
-            } elseif ($pageCount >= 2) {
-                $weight *= 1.1;
-            }
-        }
 
-        // Check if user is verified
-        $verificationRepo = new \BCCTrust\Repositories\VerificationRepository();
-        if ($verificationRepo->isVerified($userId)) {
-            $weight *= 1.2;
+            // Check if user is verified
+            if ($userInfo->is_verified) {
+                $weight *= 1.2;
+            }
         }
 
         // Time-based multiplier
@@ -436,16 +440,17 @@ class EndorsementRepository {
     }
 
     /**
-     * Update endorser's stats
+     * Update endorser's stats in user_info table
      */
     private function updateEndorserStats(int $userId): void {
         $endorsementCount = $this->countByEndorser($userId);
-        update_user_meta($userId, 'bcc_trust_endorsements_given', $endorsementCount);
-        update_user_meta($userId, 'bcc_trust_last_active', time());
+        
+        // Update user_info table
+        $this->userInfoRepo->updateEndorsementsGiven($userId, $endorsementCount);
     }
 
     /**
-     * Update fraud score
+     * Update fraud score in user_info table
      */
     private function updateFraudScore(int $userId, array $fraudAnalysis, array $automationData): void {
         $currentFraud = $fraudAnalysis['score'];
@@ -461,7 +466,9 @@ class EndorsementRepository {
 
         if ($increase > 0) {
             $newFraud = min(100, $currentFraud + $increase);
-            update_user_meta($userId, 'bcc_trust_fraud_score', $newFraud);
+            
+            // Update user_info table
+            $this->userInfoRepo->updateFraudScore($userId, $newFraud);
             
             AuditLogger::log('fraud_score_increased', $userId, [
                 'old_score' => $currentFraud,
@@ -548,10 +555,13 @@ class EndorsementRepository {
         // TRUST GRAPH ANALYSIS
         // ======================================================
 
-        $trustRank = (float) get_user_meta($endorserUserId, 'bcc_trust_graph_rank', true);
+        // Get trust rank from user_info table
+        $userInfo = $this->userInfoRepo->getByUserId($endorserUserId);
+        $trustRank = $userInfo ? (float) $userInfo->trust_rank : 0;
+        
         if (!$trustRank) {
             $trustRank = $this->trustGraph->calculateTrustRank($endorserUserId);
-            update_user_meta($endorserUserId, 'bcc_trust_graph_rank', $trustRank);
+            $this->userInfoRepo->updateTrustRank($endorserUserId, $trustRank);
         }
 
         $rings = $this->trustGraph->detectVoteRings(3);

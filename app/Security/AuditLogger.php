@@ -13,10 +13,8 @@ class AuditLogger {
      * Initialize table name
      */
     private static function getTable(): string {
-        global $wpdb;
-        
         if (!isset(self::$table)) {
-            self::$table = $wpdb->prefix . 'bcc_trust_activity'; // Fixed table name
+            self::$table = bcc_trust_activity_table();
         }
         
         return self::$table;
@@ -52,11 +50,10 @@ class AuditLogger {
         }
 
         $data = [
-            'user_id'       => $currentUserId ?: null,
+            'user_id'       => $currentUserId ?: 0, // Default to 0 instead of null
             'action'        => sanitize_text_field($action),
-            'target_type'   => $targetType ? sanitize_text_field($targetType) : null,
-            'target_id'     => $targetId,
-            'metadata'      => !empty($meta) ? json_encode($meta) : null,
+            'target_type'   => $targetType ? sanitize_text_field($targetType) : '',
+            'target_id'     => $targetId ?: 0,
             'ip_address'    => $ipBinary,
             'created_at'    => current_time('mysql', 1)
         ];
@@ -64,7 +61,7 @@ class AuditLogger {
         $wpdb->insert(
             $table,
             $data,
-            ['%d', '%s', '%s', '%d', '%s', '%s', '%s']
+            ['%d', '%s', '%s', '%d', '%s', '%s']
         );
 
         // For high-value actions, log to error log as well
@@ -214,6 +211,59 @@ class AuditLogger {
     }
 
     /**
+     * Get activity summary for dashboard
+     */
+    public static function getSummary(int $hours = 24): object {
+        global $wpdb;
+
+        $table = self::getTable();
+
+        $summary = $wpdb->get_row($wpdb->prepare("
+            SELECT 
+                COUNT(*) as total_events,
+                COUNT(DISTINCT user_id) as unique_users,
+                COUNT(DISTINCT target_id) as unique_targets,
+                SUM(CASE WHEN action LIKE 'vote_%' THEN 1 ELSE 0 END) as vote_events,
+                SUM(CASE WHEN action LIKE 'endorse%' THEN 1 ELSE 0 END) as endorse_events,
+                SUM(CASE WHEN action LIKE 'flag%' THEN 1 ELSE 0 END) as flag_events,
+                SUM(CASE WHEN action LIKE 'fraud%' OR action LIKE 'suspicious%' THEN 1 ELSE 0 END) as fraud_alerts
+            FROM {$table}
+            WHERE created_at > (UTC_TIMESTAMP() - INTERVAL %d HOUR)
+        ", $hours));
+
+        if (!$summary) {
+            $summary = (object) [
+                'total_events' => 0,
+                'unique_users' => 0,
+                'unique_targets' => 0,
+                'vote_events' => 0,
+                'endorse_events' => 0,
+                'flag_events' => 0,
+                'fraud_alerts' => 0
+            ];
+        }
+
+        return $summary;
+    }
+
+    /**
+     * Get recent events for dashboard
+     */
+    public static function getRecentEvents(int $limit = 20): array {
+        global $wpdb;
+
+        $table = self::getTable();
+
+        return $wpdb->get_results($wpdb->prepare("
+            SELECT a.*, u.display_name as user_name
+            FROM {$table} a
+            LEFT JOIN {$wpdb->users} u ON a.user_id = u.ID
+            ORDER BY a.created_at DESC
+            LIMIT %d
+        ", $limit));
+    }
+
+    /**
      * Secure IP detection (Cloud-aware)
      */
     private static function getIp(): string {
@@ -290,7 +340,7 @@ class AuditLogger {
             )
         );
         
-        // Delete from main table
+     
         $wpdb->query(
             $wpdb->prepare(
                 "DELETE FROM $table 

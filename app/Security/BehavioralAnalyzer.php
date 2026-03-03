@@ -3,6 +3,9 @@ namespace BCCTrust\Security;
 
 if (!defined('ABSPATH')) exit;
 
+use BCCTrust\Repositories\UserInfoRepository;
+use BCCTrust\Repositories\PatternRepository;
+
 /**
  * Behavioral Analyzer
  * 
@@ -10,7 +13,7 @@ if (!defined('ABSPATH')) exit;
  * 
  * @package BCCTrust
  * @subpackage Security
- * @version 1.0.0
+ * @version 2.0.0
  */
 class BehavioralAnalyzer {
     
@@ -19,8 +22,13 @@ class BehavioralAnalyzer {
      */
     private string $votesTable;
     private string $activityTable;
-    private string $patternsTable;
-    private string $scoresTable; // ADDED: Missing property
+    private string $scoresTable;
+    
+    /**
+     * Repositories
+     */
+    private UserInfoRepository $userInfoRepo;
+    private PatternRepository $patternRepo;
     
     /**
      * Cache settings
@@ -32,15 +40,15 @@ class BehavioralAnalyzer {
      * Constructor
      */
     public function __construct() {
-        global $wpdb;
-        $this->votesTable = $wpdb->prefix . 'bcc_trust_votes';
-        $this->activityTable = $wpdb->prefix . 'bcc_trust_activity';
-        $this->patternsTable = $wpdb->prefix . 'bcc_trust_patterns';
-        $this->scoresTable = $wpdb->prefix . 'bcc_trust_page_scores'; // ADDED: Initialize scores table
+        $this->votesTable = bcc_trust_votes_table();
+        $this->activityTable = bcc_trust_activity_table();
+        $this->scoresTable = bcc_trust_scores_table();
+        $this->userInfoRepo = new UserInfoRepository();
+        $this->patternRepo = new PatternRepository();
     }
     
     /**
-     * Get risk level based on score - ADDED: Missing method
+     * Get risk level based on score
      */
     private function getRiskLevel(int $score): string {
         if ($score >= 80) return 'critical';
@@ -88,17 +96,25 @@ class BehavioralAnalyzer {
         // Cap score at 100
         $score = min(100, $score);
         
-        // Determine risk level - NOW USING THE ADDED METHOD
+        // Determine risk level
         $riskLevel = $this->getRiskLevel($score);
         
         // Store pattern for ML training if high risk
         if ($score > 50) {
-            $this->storePattern($userId, 'suspicious_behavior', [
-                'score' => $score,
-                'flags' => $flags,
-                'patterns' => $details
-            ], $score / 100);
+            $this->patternRepo->storePattern(
+                $userId,
+                'suspicious_behavior',
+                [
+                    'score' => $score,
+                    'flags' => $flags,
+                    'patterns' => $details
+                ],
+                $score / 100
+            );
         }
+        
+        // Update user_info table with behavior score
+        $this->userInfoRepo->updateBehaviorScore($userId, $score);
         
         $result = [
             'behavior_score' => $score,
@@ -315,7 +331,7 @@ class BehavioralAnalyzer {
         $total = array_sum($hourlyDistribution);
         $metrics['hourly_distribution'] = $hourlyDistribution;
         
-        // Get user's timezone from meta
+        // Get user's timezone from meta (still use meta for timezone)
         $userTimezone = get_user_meta($userId, 'bcc_timezone', true);
         if (!$userTimezone) {
             $userTimezone = 'UTC';
@@ -601,7 +617,7 @@ class BehavioralAnalyzer {
     private function analyzeSocialPattern(int $userId): array {
         global $wpdb;
         
-        // Get pages this user votes on - FIXED: Now using $this->scoresTable
+        // Get pages this user votes on
         $votedPages = $wpdb->get_results($wpdb->prepare(
             "SELECT DISTINCT v.page_id, s.page_owner_id
              FROM {$this->votesTable} v
@@ -815,29 +831,35 @@ class BehavioralAnalyzer {
     }
     
     /**
-     * Analyze content creation pattern
+     * Analyze content creation pattern using user_info table
      * 
      * @param int $userId
      * @return array
      */
     private function analyzeContentPattern(int $userId): array {
-        // This would integrate with PeepSo to check:
-        // - Do they create content? (pages, posts, comments)
-        // - Is their content meaningful?
-        // - Do they engage in discussions?
+        // Get user info from user_info table
+        $userInfo = $this->userInfoRepo->getByUserId($userId);
         
-        // For now, use existing data
-        $hasPages = count_user_posts($userId) > 0;
-        $hasComments = $this->countUserComments($userId) > 0;
+        if (!$userInfo) {
+            return [
+                'suspicious' => false,
+                'weight' => 0,
+                'reasons' => []
+            ];
+        }
+        
+        $hasPages = $userInfo->pages_owned > 0;
+        $hasPosts = $userInfo->posts_created > 0;
+        $hasComments = $userInfo->comments_made > 0;
         
         $suspicious = false;
         $weight = 0;
         $reasons = [];
         
         // Users who only vote but never create content are suspicious
-        $voteCount = (int) get_user_meta($userId, 'bcc_trust_votes_cast', true);
+        $voteCount = $userInfo->votes_cast;
         
-        if ($voteCount > 20 && !$hasPages && !$hasComments) {
+        if ($voteCount > 20 && !$hasPages && !$hasPosts && !$hasComments) {
             $suspicious = true;
             $weight += 30;
             $reasons[] = 'voter_only_no_content';
@@ -849,6 +871,7 @@ class BehavioralAnalyzer {
             'reasons' => $reasons,
             'metrics' => [
                 'has_pages' => $hasPages,
+                'has_posts' => $hasPosts,
                 'has_comments' => $hasComments,
                 'vote_count' => $voteCount
             ]
@@ -973,88 +996,52 @@ class BehavioralAnalyzer {
     }
     
     /**
-     * Count user comments
-     */
-    private function countUserComments(int $userId): int {
-        global $wpdb;
-        
-        return (int) $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(*) FROM {$wpdb->comments} WHERE user_id = %d",
-            $userId
-        ));
-    }
-    
-    /**
-     * Store behavioral pattern for ML training
-     */
-    private function storePattern(int $userId, string $type, array $data, float $confidence = 1.0): void {
-        global $wpdb;
-        
-        $wpdb->insert(
-            $this->patternsTable,
-            [
-                'user_id' => $userId,
-                'pattern_type' => $type,
-                'pattern_data' => json_encode($data),
-                'confidence' => $confidence,
-                'detected_at' => current_time('mysql'),
-                'expires_at' => date('Y-m-d H:i:s', strtotime('+30 days'))
-            ],
-            ['%d', '%s', '%s', '%f', '%s', '%s']
-        );
-    }
-    
-    /**
-     * Get behavior statistics for dashboard
+     * Get behavior statistics for dashboard from user_info table
      */
     public function getStats(): array {
         global $wpdb;
         
+        $userInfoTable = bcc_trust_user_info_table();
+        
         $totalAnalyzed = $wpdb->get_var("
-            SELECT COUNT(DISTINCT user_id) 
-            FROM {$wpdb->usermeta} 
-            WHERE meta_key = 'bcc_trust_last_behavior_score'
+            SELECT COUNT(*) 
+            FROM {$userInfoTable} 
+            WHERE behavior_score > 0
         ");
         
         $avgScore = $wpdb->get_var("
-            SELECT AVG(CAST(meta_value AS DECIMAL))
-            FROM {$wpdb->usermeta}
-            WHERE meta_key = 'bcc_trust_last_behavior_score'
+            SELECT AVG(behavior_score)
+            FROM {$userInfoTable}
+            WHERE behavior_score > 0
         ");
         
         $highRisk = $wpdb->get_var("
             SELECT COUNT(*)
-            FROM {$wpdb->usermeta}
-            WHERE meta_key = 'bcc_trust_last_behavior_score'
-              AND CAST(meta_value AS DECIMAL) > 70
+            FROM {$userInfoTable}
+            WHERE behavior_score > 70
         ");
         
-        // Get most common flags
-        $patterns = $wpdb->get_results("
-            SELECT pattern_data
-            FROM {$this->patternsTable}
-            WHERE pattern_type = 'suspicious_behavior'
-            ORDER BY detected_at DESC
-            LIMIT 1000
+        $mediumRisk = $wpdb->get_var("
+            SELECT COUNT(*)
+            FROM {$userInfoTable}
+            WHERE behavior_score BETWEEN 40 AND 70
         ");
         
-        $flagCounts = [];
-        foreach ($patterns as $pattern) {
-            $data = json_decode($pattern->pattern_data, true);
-            if (isset($data['flags']) && is_array($data['flags'])) {
-                foreach ($data['flags'] as $flag) {
-                    $flagCounts[$flag] = ($flagCounts[$flag] ?? 0) + 1;
-                }
-            }
-        }
+        $lowRisk = $wpdb->get_var("
+            SELECT COUNT(*)
+            FROM {$userInfoTable}
+            WHERE behavior_score BETWEEN 20 AND 39
+        ");
         
-        arsort($flagCounts);
-        $topFlags = array_slice($flagCounts, 0, 10, true);
+        // Get most common flags from patterns table
+        $topFlags = $this->patternRepo->getMostCommonFlags(10);
         
         return [
             'total_users_analyzed' => (int) $totalAnalyzed,
             'average_behavior_score' => round((float) $avgScore, 1),
             'high_risk_users' => (int) $highRisk,
+            'medium_risk_users' => (int) $mediumRisk,
+            'low_risk_users' => (int) $lowRisk,
             'top_behavior_flags' => $topFlags,
             'last_updated' => current_time('mysql')
         ];

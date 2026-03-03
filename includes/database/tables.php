@@ -77,6 +77,7 @@ function bcc_trust_create_tables() {
         endorsement_count INT UNSIGNED NOT NULL DEFAULT 0,
         last_vote_at DATETIME NULL,
         last_calculated_at DATETIME NOT NULL,
+        fraud_metadata TEXT NULL COMMENT 'JSON data about fraud detection',
         PRIMARY KEY (id),
         UNIQUE KEY unique_page_score (page_id),
         KEY idx_owner_scores (page_owner_id, total_score),
@@ -85,7 +86,7 @@ function bcc_trust_create_tables() {
         INDEX idx_page_lookup (page_id, total_score, confidence_score)
     ) $charset_collate;";
     
-    dbDelta($sql);
+    dbDelta($sql);   
     
     /*
     ============================================================
@@ -167,7 +168,6 @@ function bcc_trust_create_tables() {
         action VARCHAR(50) NOT NULL,
         target_type VARCHAR(50) NOT NULL,
         target_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        metadata TEXT NULL,
         ip_address VARBINARY(16) NULL,
         created_at DATETIME NOT NULL,
         PRIMARY KEY (id),
@@ -214,6 +214,7 @@ function bcc_trust_create_tables() {
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         user_id BIGINT UNSIGNED NOT NULL,
         reputation_score DECIMAL(5,2) NOT NULL DEFAULT 50.00,
+        reputation_tier VARCHAR(20) NOT NULL DEFAULT 'neutral',
         total_votes_cast INT UNSIGNED NOT NULL DEFAULT 0,
         total_votes_received INT UNSIGNED NOT NULL DEFAULT 0,
         flag_count INT UNSIGNED NOT NULL DEFAULT 0,
@@ -221,14 +222,15 @@ function bcc_trust_create_tables() {
         last_calculated_at DATETIME NOT NULL,
         PRIMARY KEY (id),
         UNIQUE KEY unique_user (user_id),
-        KEY idx_score (reputation_score)
+        KEY idx_score (reputation_score),
+        KEY idx_tier (reputation_tier)
     ) $charset_collate;";
     
     dbDelta($sql);
     
     /*
     ============================================================
-    DEVICE FINGERPRINTS TABLE - NEW
+    DEVICE FINGERPRINTS TABLE
     ============================================================
     */
     $fingerprints_table = bcc_trust_fingerprints_table();
@@ -277,14 +279,67 @@ function bcc_trust_create_tables() {
     
     dbDelta($sql);
     
-    // Store schema version
-    update_option('bcc_trust_db_version', BCC_TRUST_VERSION);
+    /*
+    ============================================================
+    FRAUD ANALYSIS RESULTS - Store comprehensive fraud analysis
+    ============================================================
+    */
+    $fraud_analysis_table = bcc_trust_fraud_analysis_table();
+    
+    $sql = "CREATE TABLE IF NOT EXISTS $fraud_analysis_table (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NOT NULL,
+        fraud_score TINYINT UNSIGNED NOT NULL,
+        risk_level VARCHAR(20) NOT NULL,
+        confidence DECIMAL(3,2) NOT NULL,
+        triggers TEXT NOT NULL COMMENT 'JSON array of trigger reasons',
+        details TEXT NULL COMMENT 'JSON details of analysis',
+        analyzed_at DATETIME NOT NULL,
+        expires_at DATETIME NULL,
+        PRIMARY KEY (id),
+        KEY idx_user (user_id),
+        KEY idx_score (fraud_score),
+        KEY idx_risk (risk_level),
+        KEY idx_expires (expires_at),
+        INDEX idx_user_recent (user_id, analyzed_at)
+    ) $charset_collate;";
+    
+    dbDelta($sql);
+    
+    /*
+    ============================================================
+    SUSPENSIONS - Track user suspension history
+    ============================================================
+    */
+    $suspensions_table = bcc_trust_suspensions_table();
+    
+    $sql = "CREATE TABLE IF NOT EXISTS $suspensions_table (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NOT NULL,
+        suspended_by BIGINT UNSIGNED NOT NULL COMMENT '0 = system, otherwise admin user ID',
+        reason VARCHAR(100) NOT NULL,
+        fraud_score_at_time TINYINT UNSIGNED NULL,
+        notes TEXT NULL,
+        suspended_at DATETIME NOT NULL,
+        expires_at DATETIME NULL,
+        unsuspended_at DATETIME NULL,
+        unsuspended_by BIGINT UNSIGNED NULL,
+        PRIMARY KEY (id),
+        KEY idx_user (user_id),
+        KEY idx_status (suspended_at, unsuspended_at),
+        KEY idx_expires (expires_at)
+    ) $charset_collate;";
+    
+    dbDelta($sql);
+    
+    // Store schema version - increment version to trigger rebuild on existing sites
+    update_option('bcc_trust_db_version', '1.2.0'); // Incremented for new tables
     
     return true;
 }
 
 /**
- * Create User Info Table - Separate function
+ * Create User Info Table - Fixed version with no usr_id and no FULLTEXT indexes
  */
 function bcc_trust_create_user_info_table() {
     global $wpdb;
@@ -301,15 +356,10 @@ function bcc_trust_create_user_info_table() {
         registered datetime DEFAULT NULL,
         
         -- PeepSo specific data
-        usr_id bigint(20) DEFAULT NULL,
         usr_last_activity datetime DEFAULT NULL,
         usr_views int(11) DEFAULT 0,
         usr_likes int(11) DEFAULT 0,
         usr_role varchar(50) DEFAULT NULL,
-        usr_cover_photo varchar(255) DEFAULT NULL,
-        usr_avatar_custom varchar(255) DEFAULT NULL,
-        usr_gender varchar(20) DEFAULT NULL,
-        usr_birthdate date DEFAULT NULL,
         
         -- Trust & Fraud scores
         fraud_score int(3) DEFAULT 0,
@@ -327,21 +377,21 @@ function bcc_trust_create_user_info_table() {
         pages_joined int(11) DEFAULT 0,
         pages_moderated int(11) DEFAULT 0,
         pages_pending int(11) DEFAULT 0,
-        page_ids_owned longtext, -- JSON array of page IDs
-        page_ids_joined longtext, -- JSON array of page IDs
+        page_ids_owned longtext,
+        page_ids_joined longtext,
         
         -- Group statistics
         groups_owned int(11) DEFAULT 0,
         groups_joined int(11) DEFAULT 0,
         groups_moderated int(11) DEFAULT 0,
         groups_pending int(11) DEFAULT 0,
-        group_ids_owned longtext, -- JSON array of group IDs
-        group_ids_joined longtext, -- JSON array of group IDs
+        group_ids_owned longtext,
+        group_ids_joined longtext,
         
         -- Post/Comment statistics
         posts_created int(11) DEFAULT 0,
         comments_made int(11) DEFAULT 0,
-        post_ids_created longtext, -- JSON array of post IDs
+        post_ids_created longtext,
         last_post_date datetime DEFAULT NULL,
         last_comment_date datetime DEFAULT NULL,
         
@@ -351,24 +401,16 @@ function bcc_trust_create_user_info_table() {
         device_fingerprint varchar(255) DEFAULT NULL,
         
         -- Fraud detection data
-        fraud_triggers longtext, -- JSON array of triggers
-        trust_graph_data longtext, -- JSON data for trust graph
-        
-        -- Metadata
-        metadata longtext, -- Additional JSON data
-        created_at datetime DEFAULT CURRENT_TIMESTAMP,
-        updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        
+        fraud_triggers longtext,
+        trust_graph_data longtext,
+       
         PRIMARY KEY (id),
         UNIQUE KEY user_id (user_id),
-        UNIQUE KEY usr_id (usr_id),
         KEY fraud_score (fraud_score),
         KEY risk_level (risk_level),
         KEY pages_owned (pages_owned),
         KEY groups_owned (groups_owned),
-        KEY usr_last_activity (usr_last_activity),
-        FULLTEXT KEY page_ids_owned (page_ids_owned),
-        FULLTEXT KEY group_ids_joined (group_ids_joined)
+        KEY usr_last_activity (usr_last_activity)
     ) $charset_collate;";
     
     require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
@@ -526,15 +568,10 @@ function bcc_trust_sync_user_info($user_id = null) {
             'registered' => $user->user_registered,
             
             // PeepSo data
-            'usr_id' => $peepso_user ? $peepso_user->usr_id : null,
             'usr_last_activity' => $peepso_user ? $peepso_user->usr_last_activity : null,
             'usr_views' => $peepso_user ? (int)$peepso_user->usr_views : 0,
             'usr_likes' => $peepso_user ? (int)$peepso_user->usr_likes : 0,
             'usr_role' => $peepso_user ? $peepso_user->usr_role : null,
-            'usr_cover_photo' => $peepso_user ? $peepso_user->usr_cover_photo : null,
-            'usr_avatar_custom' => $peepso_user ? $peepso_user->usr_avatar_custom : null,
-            'usr_gender' => $peepso_user ? $peepso_user->usr_gender : null,
-            'usr_birthdate' => $peepso_user ? $peepso_user->usr_birthdate : null,
             
             // Trust scores
             'fraud_score' => $fraud_score,
@@ -573,12 +610,7 @@ function bcc_trust_sync_user_info($user_id = null) {
             'last_ip_address' => get_user_meta($user->ID, 'bcc_trust_last_ip', true),
             'device_fingerprint' => get_user_meta($user->ID, 'bcc_trust_device_fingerprint', true),
             'automation_score' => (int) get_user_meta($user->ID, 'bcc_trust_automation_score', true),
-            
-            'metadata' => json_encode([
-                'roles' => implode(', ', $user->roles),
-                'first_seen' => get_user_meta($user->ID, 'bcc_trust_first_seen', true),
-                'last_login' => get_user_meta($user->ID, 'bcc_trust_last_login', true)
-            ])
+            'trust_graph_data' => null,
         ];
         
         // Check if record exists
@@ -587,10 +619,39 @@ function bcc_trust_sync_user_info($user_id = null) {
             $user->ID
         ));
         
+        // Create format specifiers array
+        $formats = [];
+        foreach ($data as $key => $value) {
+            // Determine format based on field name
+            if (in_array($key, ['fraud_score', 'automation_score', 'behavior_score', 'votes_cast', 'endorsements_given', 
+                                 'pages_owned', 'pages_joined', 'pages_moderated', 'pages_pending', 
+                                 'groups_owned', 'groups_joined', 'groups_moderated', 'groups_pending',
+                                 'posts_created', 'comments_made', 'usr_views', 'usr_likes'])) {
+                $formats[] = '%d'; // Integer
+            } elseif (in_array($key, ['trust_rank'])) {
+                $formats[] = '%f'; // Float
+            } elseif (in_array($key, ['last_post_date', 'last_comment_date', 'usr_last_activity', 'last_login', 'registered', 'page_ids_owned', 
+                                       'page_ids_joined', 'group_ids_owned', 'group_ids_joined', 'post_ids_created', 'fraud_triggers'])) {
+                $formats[] = '%s'; // String (including JSON and dates)
+            } else {
+                $formats[] = '%s'; // Default to string
+            }
+        }
+        
         if ($exists) {
-            $wpdb->update($table_name, $data, ['user_id' => $user->ID]);
+            $wpdb->update(
+                $table_name, 
+                $data, 
+                ['user_id' => $user->ID],
+                $formats,
+                ['%d'] // user_id is integer
+            );
         } else {
-            $wpdb->insert($table_name, $data);
+            $wpdb->insert(
+                $table_name, 
+                $data,
+                $formats
+            );
         }
         
         $synced_count++;
@@ -643,7 +704,7 @@ function bcc_trust_reputation_table() {
 }
 
 /**
- * NEW: Device fingerprints table
+ * Device fingerprints table
  */
 function bcc_trust_fingerprints_table() {
     global $wpdb;
@@ -651,7 +712,7 @@ function bcc_trust_fingerprints_table() {
 }
 
 /**
- * NEW: Behavioral patterns table for ML
+ * Behavioral patterns table for ML
  */
 function bcc_trust_patterns_table() {
     global $wpdb;
@@ -659,7 +720,7 @@ function bcc_trust_patterns_table() {
 }
 
 /**
- * NEW: User info table
+ * User info table
  */
 function bcc_trust_user_info_table() {
     global $wpdb;
@@ -667,8 +728,21 @@ function bcc_trust_user_info_table() {
 }
 
 /**
- * FIXED: Get page owner from PeepSo with correct column names
+ * NEW: Fraud analysis table
  */
+function bcc_trust_fraud_analysis_table() {
+    global $wpdb;
+    return $wpdb->prefix . 'bcc_trust_fraud_analysis';
+}
+
+/**
+ * NEW: Suspensions table
+ */
+function bcc_trust_suspensions_table() {
+    global $wpdb;
+    return $wpdb->prefix . 'bcc_trust_suspensions';
+}
+
 function bcc_trust_get_page_owner($page_id) {
     global $wpdb;
     
@@ -749,6 +823,16 @@ add_action('bcc_trust_daily_cleanup', function() {
             "DELETE FROM {$patterns_table} WHERE expires_at < %s OR (expires_at IS NULL AND detected_at < %s)",
             current_time('mysql'),
             date('Y-m-d H:i:s', strtotime('-30 days'))
+        )
+    );
+    
+    // Clean old fraud analysis (older than 90 days)
+    $fraud_analysis_table = bcc_trust_fraud_analysis_table();
+    $wpdb->query(
+        $wpdb->prepare(
+            "DELETE FROM {$fraud_analysis_table} WHERE expires_at < %s OR (expires_at IS NULL AND analyzed_at < %s)",
+            current_time('mysql'),
+            date('Y-m-d H:i:s', strtotime('-90 days'))
         )
     );
 });
@@ -896,7 +980,7 @@ function bcc_trust_sync_user_pages($user_id = null) {
 }
 
 /**
- * FIXED: AJAX handler for initializing page score
+ * AJAX handler for initializing page score
  */
 add_action('wp_ajax_bcc_trust_init_page_score', 'bcc_trust_ajax_init_page_score');
 function bcc_trust_ajax_init_page_score() {
@@ -937,7 +1021,7 @@ function bcc_trust_ajax_init_page_score() {
             $scoresTable,
             [
                 'page_id' => $page_id,
-                'page_owner_id' => $owner_id, // FIXED: was $user_id
+                'page_owner_id' => $owner_id,
                 'total_score' => 50.00,
                 'positive_score' => 0,
                 'negative_score' => 0,

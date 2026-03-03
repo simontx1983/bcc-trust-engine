@@ -6,6 +6,9 @@ if (!defined('ABSPATH')) {
 /**
  * Trust Engine Moderation Tools
  * Enhanced with fraud detection, behavioral analysis, and device fingerprinting
+ * 
+ * @package BCC_Trust_Engine
+ * @version 2.0.0
  */
 
 add_action('admin_menu', function () {
@@ -31,13 +34,28 @@ function bcc_trust_render_moderation() {
         $userId = intval($_POST['user_id']);
         $reason = isset($_POST['suspend_reason']) ? sanitize_text_field($_POST['suspend_reason']) : 'manual_suspension';
         
-        update_user_meta($userId, 'bcc_trust_suspended', 1);
-        update_user_meta($userId, 'bcc_trust_suspended_at', current_time('mysql'));
-        update_user_meta($userId, 'bcc_trust_suspended_by', get_current_user_id());
-        update_user_meta($userId, 'bcc_trust_suspended_reason', $reason);
+        // Get current fraud score
+        $userInfoTable = bcc_trust_user_info_table();
+        $userInfo = $wpdb->get_row($wpdb->prepare(
+            "SELECT fraud_score FROM {$userInfoTable} WHERE user_id = %d",
+            $userId
+        ));
+        
+        // Insert into suspensions table
+        $suspensionsTable = bcc_trust_suspensions_table();
+        $wpdb->insert(
+            $suspensionsTable,
+            [
+                'user_id' => $userId,
+                'suspended_by' => get_current_user_id(),
+                'reason' => $reason,
+                'fraud_score_at_time' => $userInfo ? $userInfo->fraud_score : null,
+                'suspended_at' => current_time('mysql')
+            ],
+            ['%d', '%d', '%s', '%d', '%s']
+        );
         
         // Update user_info table
-        $userInfoTable = bcc_trust_user_info_table();
         $wpdb->update(
             $userInfoTable,
             ['is_suspended' => 1],
@@ -59,10 +77,22 @@ function bcc_trust_render_moderation() {
 
     if (isset($_POST['unsuspend_user']) && check_admin_referer('bcc_trust_moderation')) {
         $userId = intval($_POST['user_id']);
-        delete_user_meta($userId, 'bcc_trust_suspended');
-        delete_user_meta($userId, 'bcc_trust_suspended_at');
-        delete_user_meta($userId, 'bcc_trust_suspended_by');
-        delete_user_meta($userId, 'bcc_trust_suspended_reason');
+        
+        // Update suspensions table
+        $suspensionsTable = bcc_trust_suspensions_table();
+        $wpdb->update(
+            $suspensionsTable,
+            [
+                'unsuspended_at' => current_time('mysql'),
+                'unsuspended_by' => get_current_user_id()
+            ],
+            [
+                'user_id' => $userId,
+                'unsuspended_at' => null
+            ],
+            ['%s', '%d'],
+            ['%d', '%s']
+        );
         
         // Update user_info table
         $userInfoTable = bcc_trust_user_info_table();
@@ -115,10 +145,9 @@ function bcc_trust_render_moderation() {
         );
 
         // Recalculate scores for affected pages
-        if (class_exists('BCC_Page_Score_Calculator')) {
-            $calculator = new BCC_Page_Score_Calculator();
+        if (function_exists('bcc_trust_recalculate_page_score')) {
             foreach ($affectedPages as $pageId) {
-                $calculator->recalculate_page_score($pageId);
+                bcc_trust_recalculate_page_score($pageId);
             }
         }
 
@@ -177,18 +206,21 @@ function bcc_trust_render_moderation() {
         if (class_exists('BCCTrust\Security\FraudDetector')) {
             $newScore = BCCTrust\Security\FraudDetector::getEnhancedFraudScore($userId);
             
+            // Get updated analysis
+            $analysis = BCCTrust\Security\FraudDetector::analyzeFraud($userId);
+            
             // Update user_info table with new fraud data
-            $analysis = get_user_meta($userId, 'bcc_trust_fraud_analysis', true);
             $userInfoTable = bcc_trust_user_info_table();
             $wpdb->update(
                 $userInfoTable,
                 [
                     'fraud_score' => $newScore,
                     'risk_level' => $analysis['risk_level'] ?? 'unknown',
-                    'fraud_triggers' => isset($analysis['triggers']) ? json_encode($analysis['triggers']) : null
+                    'fraud_triggers' => isset($analysis['triggers']) ? json_encode($analysis['triggers']) : null,
+                    'behavior_score' => $analysis['details']['behavior_score'] ?? 0
                 ],
                 ['user_id' => $userId],
-                ['%d', '%s', '%s'],
+                ['%d', '%s', '%s', '%d'],
                 ['%d']
             );
             
@@ -219,6 +251,7 @@ function bcc_trust_render_user_list() {
     global $wpdb;
     
     $userInfoTable = bcc_trust_user_info_table();
+    $suspensionsTable = bcc_trust_suspensions_table();
     
     $search = isset($_GET['s']) ? sanitize_text_field($_GET['s']) : '';
     $filter = isset($_GET['filter']) ? sanitize_key($_GET['filter']) : 'all';
@@ -264,7 +297,12 @@ function bcc_trust_render_user_list() {
     $total_items = $wpdb->get_var($count_sql);
 
     // Get users from user_info table
-    $sql = "SELECT * FROM {$userInfoTable} WHERE {$where_clause} ORDER BY fraud_score DESC LIMIT %d OFFSET %d";
+    $sql = "SELECT ui.*, 
+                   (SELECT COUNT(*) FROM {$suspensionsTable} s WHERE s.user_id = ui.user_id AND s.unsuspended_at IS NULL) as active_suspensions
+            FROM {$userInfoTable} ui 
+            WHERE {$where_clause} 
+            ORDER BY ui.fraud_score DESC 
+            LIMIT %d OFFSET %d";
     $params[] = $per_page;
     $params[] = $offset;
     
@@ -323,7 +361,6 @@ function bcc_trust_render_user_list() {
             <thead>
                 <tr>
                     <th>User</th>
-                    <th>Role</th>
                     <th>Email</th>
                     <th>Status</th>
                     <th>Fraud Score</th>
@@ -336,7 +373,7 @@ function bcc_trust_render_user_list() {
             <tbody>
                 <?php if (empty($users)): ?>
                     <tr>
-                        <td colspan="9" style="text-align:center; padding:20px;">
+                        <td colspan="8" style="text-align:center; padding:20px;">
                             <strong>No users found matching your criteria.</strong>
                         </td>
                     </tr>
@@ -353,15 +390,9 @@ function bcc_trust_render_user_list() {
                                 <strong><?php echo esc_html($user->display_name); ?></strong>
                                 <br><small>ID: <?php echo $user->user_id; ?></small>
                             </td>
-                            <td>
-                                <?php 
-                                $metadata = json_decode($user->metadata, true);
-                                echo isset($metadata['roles']) ? esc_html($metadata['roles']) : '—';
-                                ?>
-                            </td>
                             <td><?php echo esc_html($user->user_email); ?></td>
                             <td>
-                                <?php if ($user->is_suspended): ?>
+                                <?php if ($user->is_suspended || $user->active_suspensions > 0): ?>
                                     <span class="status-badge suspended" style="background:#f44336; color:#fff; padding:3px 8px; border-radius:3px;">Suspended</span>
                                 <?php else: ?>
                                     <span class="status-badge active" style="background:#4caf50; color:#fff; padding:3px 8px; border-radius:3px;">Active</span>
@@ -442,7 +473,7 @@ function bcc_trust_render_user_list() {
 }
 
 /**
- * Render detailed user moderation view - UPDATED to use user_info table
+ * Render detailed user moderation view - UPDATED to use new tables
  */
 function bcc_trust_render_user_moderation($userId) {
     global $wpdb;
@@ -453,6 +484,8 @@ function bcc_trust_render_user_moderation($userId) {
     $auditTable = bcc_trust_activity_table();
     $scoresTable = bcc_trust_scores_table();
     $fingerprintTable = bcc_trust_fingerprints_table();
+    $fraudAnalysisTable = bcc_trust_fraud_analysis_table();
+    $suspensionsTable = bcc_trust_suspensions_table();
 
     // Get user data from user_info table
     $userInfo = $wpdb->get_row($wpdb->prepare(
@@ -466,9 +499,23 @@ function bcc_trust_render_user_moderation($userId) {
         return;
     }
 
-    // Parse metadata
-    $metadata = $userInfo->metadata ? json_decode($userInfo->metadata, true) : [];
+    // Parse fraud triggers
     $fraudTriggers = $userInfo->fraud_triggers ? json_decode($userInfo->fraud_triggers, true) : [];
+
+    // Get suspension history
+    $suspensionHistory = $wpdb->get_results($wpdb->prepare("
+        SELECT * FROM {$suspensionsTable}
+        WHERE user_id = %d
+        ORDER BY suspended_at DESC
+    ", $userId));
+
+    // Get fraud analysis history
+    $fraudAnalysisHistory = $wpdb->get_results($wpdb->prepare("
+        SELECT * FROM {$fraudAnalysisTable}
+        WHERE user_id = %d
+        ORDER BY analyzed_at DESC
+        LIMIT 20
+    ", $userId));
 
     // Get user's pages and their scores
     $userPages = $wpdb->get_results($wpdb->prepare("
@@ -514,15 +561,6 @@ function bcc_trust_render_user_moderation($userId) {
         WHERE user_id = %d
         ORDER BY last_seen DESC
     ", $userId));
-
-    // Get fraud score history (from activity log)
-    $fraudHistory = $wpdb->get_results($wpdb->prepare("
-        SELECT created_at, metadata
-        FROM {$auditTable}
-        WHERE user_id = %d AND action = 'fraud_score_increased'
-        ORDER BY created_at DESC
-        LIMIT 10
-    ", $userId));
     ?>
 
     <div class="wrap">
@@ -559,7 +597,7 @@ function bcc_trust_render_user_moderation($userId) {
                 </tr>
                 <tr>
                     <th>Roles</th>
-                    <td><?php echo isset($metadata['roles']) ? esc_html($metadata['roles']) : implode(', ', array_map('esc_html', $user->roles)); ?></td>
+                    <td><?php echo implode(', ', array_map('esc_html', $user->roles)); ?></td>
                 </tr>
                 <tr>
                     <th>PeepSo User ID</th>
@@ -568,14 +606,6 @@ function bcc_trust_render_user_moderation($userId) {
                 <tr>
                     <th>Last Activity</th>
                     <td><?php echo $userInfo->usr_last_activity ? esc_html($userInfo->usr_last_activity) : '—'; ?></td>
-                </tr>
-                <tr>
-                    <th>Last Login</th>
-                    <td><?php echo isset($metadata['last_login']) ? esc_html($metadata['last_login']) : '—'; ?></td>
-                </tr>
-                <tr>
-                    <th>First Seen</th>
-                    <td><?php echo isset($metadata['first_seen']) ? esc_html($metadata['first_seen']) : '—'; ?></td>
                 </tr>
                 <tr>
                     <th>Verified</th>
@@ -587,22 +617,6 @@ function bcc_trust_render_user_moderation($userId) {
                         <span class="status-badge <?php echo $userInfo->is_suspended ? 'suspended' : 'active'; ?>" style="background:<?php echo $userInfo->is_suspended ? '#f44336' : '#4caf50'; ?>; color:#fff; padding:3px 8px; border-radius:3px;">
                             <?php echo $userInfo->is_suspended ? 'Suspended' : 'Active'; ?>
                         </span>
-                        <?php 
-                        $suspendedAt = get_user_meta($userId, 'bcc_trust_suspended_at', true);
-                        $suspendedBy = get_user_meta($userId, 'bcc_trust_suspended_by', true);
-                        $suspendedReason = get_user_meta($userId, 'bcc_trust_suspended_reason', true);
-                        
-                        if ($userInfo->is_suspended && $suspendedAt): ?>
-                            <br><small>Since: <?php echo esc_html($suspendedAt); ?></small>
-                            <?php if ($suspendedBy): 
-                                $suspender = get_userdata($suspendedBy);
-                            ?>
-                                <br><small>By: <?php echo $suspender ? esc_html($suspender->display_name) : 'User #' . $suspendedBy; ?></small>
-                            <?php endif; ?>
-                            <?php if ($suspendedReason): ?>
-                                <br><small>Reason: <?php echo esc_html($suspendedReason); ?></small>
-                            <?php endif; ?>
-                        <?php endif; ?>
                     </td>
                 </tr>
             </table>
@@ -621,7 +635,6 @@ function bcc_trust_render_user_moderation($userId) {
                         </div>
                         <span style="font-size:24px; font-weight:bold;"><?php echo $userInfo->fraud_score; ?></span>
                     </div>
-                    <small>Updated: <?php echo get_user_meta($userId, 'bcc_trust_fraud_updated', true) ? date('Y-m-d H:i', get_user_meta($userId, 'bcc_trust_fraud_updated', true)) : 'Never'; ?></small>
                 </div>
                 
                 <div class="stat-card">
@@ -639,12 +652,16 @@ function bcc_trust_render_user_moderation($userId) {
                         </div>
                         <span style="font-size:24px; font-weight:bold;"><?php echo number_format($userInfo->trust_rank, 2); ?></span>
                     </div>
-                    <small>Updated: <?php echo get_user_meta($userId, 'bcc_trust_graph_updated', true) ? date('Y-m-d H:i', get_user_meta($userId, 'bcc_trust_graph_updated', true)) : 'Never'; ?></small>
                 </div>
                 
                 <div class="stat-card">
                     <h3 style="margin:0 0 5px 0; font-size:14px; color:#555;">Behavior Score</h3>
                     <span style="font-size:24px; font-weight:bold;"><?php echo $userInfo->behavior_score ?: 'N/A'; ?></span>
+                </div>
+                
+                <div class="stat-card">
+                    <h3 style="margin:0 0 5px 0; font-size:14px; color:#555;">Automation Score</h3>
+                    <span style="font-size:24px; font-weight:bold;"><?php echo $userInfo->automation_score ?: '0'; ?>%</span>
                 </div>
             </div>
             
@@ -733,31 +750,86 @@ function bcc_trust_render_user_moderation($userId) {
             </div>
         </div>
 
-        <!-- Fraud History -->
-        <?php if (!empty($fraudHistory)): ?>
-            <div class="fraud-history" style="background:#fff; padding:20px; margin-top:20px; border:1px solid #ccd0d4;">
-                <h2>Fraud Score History</h2>
+        <!-- Suspension History -->
+        <?php if (!empty($suspensionHistory)): ?>
+            <div class="suspension-history" style="background:#fff; padding:20px; margin-top:20px; border:1px solid #ccd0d4;">
+                <h2>Suspension History</h2>
                 <table class="wp-list-table widefat fixed striped">
                     <thead>
                         <tr>
-                            <th>Date</th>
-                            <th>Change</th>
+                            <th>Suspended</th>
+                            <th>By</th>
                             <th>Reason</th>
+                            <th>Fraud Score</th>
+                            <th>Unsuspended</th>
+                            <th>Notes</th>
                         </tr>
                     </thead>
                     <tbody>
-                        <?php foreach ($fraudHistory as $history): 
-                            $meta = json_decode($history->metadata, true);
+                        <?php foreach ($suspensionHistory as $sus): 
+                            $suspender = $sus->suspended_by ? get_userdata($sus->suspended_by) : null;
+                            $unsuspender = $sus->unsuspended_by ? get_userdata($sus->unsuspended_by) : null;
                         ?>
                             <tr>
-                                <td><?php echo esc_html($history->created_at); ?></td>
+                                <td><?php echo esc_html($sus->suspended_at); ?></td>
+                                <td><?php echo $suspender ? esc_html($suspender->display_name) : 'System'; ?></td>
+                                <td><?php echo esc_html($sus->reason); ?></td>
+                                <td><?php echo $sus->fraud_score_at_time ?: '—'; ?></td>
                                 <td>
-                                    <?php if (isset($meta['old_score']) && isset($meta['new_score'])): ?>
-                                        <?php echo $meta['old_score']; ?> → <strong><?php echo $meta['new_score']; ?></strong>
-                                        (<?php echo ($meta['new_score'] - $meta['old_score'] > 0 ? '+' : '') . ($meta['new_score'] - $meta['old_score']); ?>)
+                                    <?php if ($sus->unsuspended_at): ?>
+                                        <?php echo esc_html($sus->unsuspended_at); ?><br>
+                                        <small>by <?php echo $unsuspender ? esc_html($unsuspender->display_name) : 'System'; ?></small>
+                                    <?php else: ?>
+                                        <strong style="color:#f44336;">Active</strong>
                                     <?php endif; ?>
                                 </td>
-                                <td><?php echo esc_html($meta['reason'] ?? 'Unknown'); ?></td>
+                                <td><?php echo esc_html($sus->notes ?: '—'); ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        <?php endif; ?>
+
+        <!-- Fraud Analysis History -->
+        <?php if (!empty($fraudAnalysisHistory)): ?>
+            <div class="fraud-analysis-history" style="background:#fff; padding:20px; margin-top:20px; border:1px solid #ccd0d4;">
+                <h2>Fraud Analysis History</h2>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead>
+                        <tr>
+                            <th>Analyzed</th>
+                            <th>Score</th>
+                            <th>Risk Level</th>
+                            <th>Confidence</th>
+                            <th>Triggers</th>
+                            <th>Expires</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($fraudAnalysisHistory as $analysis): 
+                            $triggers = json_decode($analysis->triggers, true);
+                        ?>
+                            <tr>
+                                <td><?php echo esc_html($analysis->analyzed_at); ?></td>
+                                <td><strong><?php echo $analysis->fraud_score; ?></strong></td>
+                                <td>
+                                    <span style="padding:2px 5px; border-radius:3px; background:<?php echo bcc_trust_get_risk_color($analysis->risk_level); ?>; color:#fff;">
+                                        <?php echo esc_html(ucfirst($analysis->risk_level)); ?>
+                                    </span>
+                                </td>
+                                <td><?php echo round($analysis->confidence * 100); ?>%</td>
+                                <td>
+                                    <?php 
+                                    if (!empty($triggers)) {
+                                        echo esc_html(implode(', ', array_slice($triggers, 0, 3)));
+                                        if (count($triggers) > 3) echo '...';
+                                    } else {
+                                        echo '—';
+                                    }
+                                    ?>
+                                </td>
+                                <td><?php echo $analysis->expires_at ? esc_html($analysis->expires_at) : 'Never'; ?></td>
                             </tr>
                         <?php endforeach; ?>
                     </tbody>
@@ -880,36 +952,41 @@ function bcc_trust_render_user_moderation($userId) {
             </div>
         <?php endif; ?>
 
-        <!-- IP Addresses -->
-        <?php if ($userIPs): ?>
-            <div class="ips-box" style="background:#fff; padding:20px; margin-top:20px; border:1px solid #ccd0d4;">
-                <h2>IP Addresses Used</h2>
-                <table class="wp-list-table widefat fixed striped">
-                    <thead>
-                        <tr>
-                            <th>IP Address</th>
-                            <th>Activity Count</th>
-                            <th>Last Seen</th>
-                            <th>Action</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($userIPs as $ip):
-                            $ipAddress = inet_ntop($ip->ip_address);
-                        ?>
-                            <tr>
-                                <td><code><?php echo esc_html($ipAddress); ?></code></td>
-                                <td><?php echo $ip->count; ?></td>
-                                <td><?php echo esc_html($ip->last_seen); ?></td>
-                                <td>
-                                    <a href="<?php echo admin_url('admin.php?page=bcc-trust-moderation&ip=' . urlencode($ipAddress)); ?>" class="button button-small">Investigate</a>
-                                </td>
-                            </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
-            </div>
-        <?php endif; ?>
+ <!-- IP Addresses -->
+<?php if ($userIPs): ?>
+    <div class="ips-box" style="background:#fff; padding:20px; margin-top:20px; border:1px solid #ccd0d4;">
+        <h2>IP Addresses Used</h2>
+        <table class="wp-list-table widefat fixed striped">
+            <thead>
+                <tr>
+                    <th>IP Address</th>
+                    <th>Activity Count</th>
+                    <th>Last Seen</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($userIPs as $ip):
+                    $ipAddress = '';
+                    if (!empty($ip->ip_address)) {
+                        $converted = @inet_ntop($ip->ip_address);
+                        $ipAddress = $converted !== false ? $converted : 'Invalid IP';
+                    }
+                ?>
+                    <tr>
+                        <td><code><?php echo esc_html($ipAddress); ?></code></td>
+                        <td><?php echo $ip->count; ?></td>
+                        <td><?php echo esc_html($ip->last_seen); ?></td>
+                        <td>
+                            <a href="<?php echo admin_url('admin.php?page=bcc-trust-moderation&ip=' . urlencode($ipAddress)); ?>" class="button button-small">Investigate</a>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+<?php endif; ?>       
+
 
         <!-- Recent Activity -->
         <?php if ($recentActivity): ?>
@@ -921,7 +998,6 @@ function bcc_trust_render_user_moderation($userId) {
                             <th>Time</th>
                             <th>Action</th>
                             <th>Target</th>
-                            <th>Metadata</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -943,13 +1019,6 @@ function bcc_trust_render_user_moderation($userId) {
                                         —
                                     <?php endif; ?>
                                 </td>
-                                <td>
-                                    <?php if ($act->metadata): ?>
-                                        <pre style="margin:0; font-size:10px; max-width:200px; overflow:auto;"><?php echo esc_html(json_encode(json_decode($act->metadata), JSON_PRETTY_PRINT)); ?></pre>
-                                    <?php else: ?>
-                                        —
-                                    <?php endif; ?>
-                                </td>
                             </tr>
                         <?php endforeach; ?>
                     </tbody>
@@ -961,7 +1030,7 @@ function bcc_trust_render_user_moderation($userId) {
 }
 
 /**
- * Render IP moderation view (unchanged)
+ * Render IP moderation view - UPDATED to remove metadata
  */
 function bcc_trust_render_ip_moderation($ip) {
     global $wpdb;
@@ -1189,7 +1258,6 @@ function bcc_trust_render_ip_moderation($ip) {
                         <th>Action</th>
                         <th>User</th>
                         <th>Target</th>
-                        <th>Metadata</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -1220,13 +1288,6 @@ function bcc_trust_render_ip_moderation($ip) {
                                     —
                                 <?php endif; ?>
                             </td>
-                            <td>
-                                <?php if ($act->metadata): ?>
-                                    <pre style="margin:0; font-size:10px; max-width:200px; overflow:auto;"><?php echo esc_html(json_encode(json_decode($act->metadata), JSON_PRETTY_PRINT)); ?></pre>
-                                <?php else: ?>
-                                    —
-                                <?php endif; ?>
-                            </td>
                         </tr>
                     <?php endforeach; ?>
                 </tbody>
@@ -1237,7 +1298,7 @@ function bcc_trust_render_ip_moderation($ip) {
 }
 
 /**
- * Render fingerprint moderation view (unchanged)
+ * Render fingerprint moderation view - UPDATED
  */
 function bcc_trust_render_fingerprint_moderation($fingerprint) {
     global $wpdb;
@@ -1375,4 +1436,64 @@ function bcc_trust_render_fingerprint_moderation($fingerprint) {
         </div>
     </div>
     <?php
+}
+
+/**
+ * Handle bulk suspend action
+ */
+add_action('admin_action_bcc_trust_bulk_suspend', 'bcc_trust_handle_bulk_suspend');
+function bcc_trust_handle_bulk_suspend() {
+    if (!current_user_can('manage_options')) {
+        wp_die('Unauthorized');
+    }
+    
+    check_admin_referer('bulk-users');
+    
+    $user_ids = isset($_GET['users']) ? array_map('intval', $_GET['users']) : [];
+    $action = isset($_GET['action2']) ? $_GET['action2'] : $_GET['action'];
+    
+    if (empty($user_ids)) {
+        wp_redirect(add_query_arg('bulk', 'no_users', wp_get_referer()));
+        exit;
+    }
+    
+    $processed = 0;
+    foreach ($user_ids as $user_id) {
+        if ($action === 'suspend') {
+            // Handle suspend
+            global $wpdb;
+            $userInfoTable = bcc_trust_user_info_table();
+            $wpdb->update(
+                $userInfoTable,
+                ['is_suspended' => 1],
+                ['user_id' => $user_id],
+                ['%d'],
+                ['%d']
+            );
+            $processed++;
+        } elseif ($action === 'unsuspend') {
+            // Handle unsuspend
+            global $wpdb;
+            $userInfoTable = bcc_trust_user_info_table();
+            $wpdb->update(
+                $userInfoTable,
+                ['is_suspended' => 0],
+                ['user_id' => $user_id],
+                ['%d'],
+                ['%d']
+            );
+            $processed++;
+        } elseif ($action === 'clear_votes') {
+            // Handle clear votes
+            // Implementation here
+            $processed++;
+        } elseif ($action === 'reanalyze') {
+            // Handle reanalyze
+            // Implementation here
+            $processed++;
+        }
+    }
+    
+    wp_redirect(add_query_arg('bulk', $processed, wp_get_referer()));
+    exit;
 }

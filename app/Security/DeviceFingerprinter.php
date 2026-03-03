@@ -3,6 +3,9 @@ namespace BCCTrust\Security;
 
 if (!defined('ABSPATH')) exit;
 
+use BCCTrust\Repositories\UserInfoRepository;
+use BCCTrust\Repositories\FraudAnalysisRepository; // You'll need to create this
+
 /**
  * Device Fingerprinter
  * 
@@ -10,14 +13,24 @@ if (!defined('ABSPATH')) exit;
  * 
  * @package BCCTrust
  * @subpackage Security
- * @version 1.0.0
+ * @version 2.1.0
  */
 class DeviceFingerprinter {
     
     /**
      * Database table name
      */
-    private static $table;
+    private string $table;
+    
+    /**
+     * User info repository
+     */
+    private UserInfoRepository $userInfoRepo;
+    
+    /**
+     * Fraud analysis repository (new)
+     */
+    private $fraudAnalysisRepo;
     
     /**
      * Known bot user agents
@@ -33,8 +46,20 @@ class DeviceFingerprinter {
      * Constructor
      */
     public function __construct() {
-        global $wpdb;
-        self::$table = $wpdb->prefix . 'bcc_trust_device_fingerprints';
+        $this->table = bcc_trust_fingerprints_table();
+        $this->userInfoRepo = new UserInfoRepository();
+        
+        // Initialize fraud analysis repo if class exists
+        if (class_exists('\\BCCTrust\\Repositories\\FraudAnalysisRepository')) {
+            $this->fraudAnalysisRepo = new FraudAnalysisRepository();
+        }
+    }
+    
+    /**
+     * Get table name (for static methods)
+     */
+    private static function getTable(): string {
+        return bcc_trust_fingerprints_table();
     }
     
     /**
@@ -111,7 +136,7 @@ class DeviceFingerprinter {
             $confidence += 25;
         }
         
-        // FIXED: Check if headers is array before accessing
+        // Check if headers is array before accessing
         if (is_array($headers)) {
             // Check for PhantomJS
             if ((isset($headers['Phantom-Version']) && $headers['Phantom-Version']) || 
@@ -241,14 +266,9 @@ class DeviceFingerprinter {
     public function storeFingerprint(int $userId, string $fingerprint, array $automationData = []) {
         global $wpdb;
         
-        // Ensure table name is set
-        if (!self::$table) {
-            self::$table = $wpdb->prefix . 'bcc_trust_device_fingerprints';
-        }
-        
         // Check if this fingerprint exists for other users
         $existingUsers = $wpdb->get_results($wpdb->prepare(
-            "SELECT DISTINCT user_id FROM " . self::$table . " 
+            "SELECT DISTINCT user_id FROM {$this->table} 
              WHERE fingerprint = %s AND user_id != %d",
             $fingerprint,
             $userId
@@ -271,7 +291,7 @@ class DeviceFingerprinter {
         
         // Check if fingerprint already exists for this user
         $existing = $wpdb->get_row($wpdb->prepare(
-            "SELECT id FROM " . self::$table . " 
+            "SELECT id FROM {$this->table} 
              WHERE user_id = %d AND fingerprint = %s",
             $userId,
             $fingerprint
@@ -294,20 +314,29 @@ class DeviceFingerprinter {
         if ($existing) {
             // Update existing
             $wpdb->update(
-                self::$table,
+                $this->table,
                 $data,
                 ['id' => $existing->id],
-                ['%d', '%s', '%d', '%s', '%s', '%s', '%s', '%s'],
+                $this->getFormatSpecifiers($data),
                 ['%d']
             );
             
-            // If multiple accounts detected, log it
-            if ($multipleAccounts && class_exists('\\BCCTrust\\Security\\AuditLogger')) {
-                AuditLogger::log('device_sharing_detected', $userId, [
-                    'fingerprint' => $fingerprint,
-                    'other_users' => wp_list_pluck($existingUsers, 'user_id'),
-                    'automation_score' => $automationData['confidence'] ?? 0
-                ], 'user');
+            // If multiple accounts detected, update user_info
+            if ($multipleAccounts) {
+                $this->userInfoRepo->incrementFraudScore($userId, 10, 'device_sharing');
+                
+                if (class_exists('\\BCCTrust\\Security\\AuditLogger')) {
+                    AuditLogger::log('device_sharing_detected', $userId, [
+                        'fingerprint' => $fingerprint,
+                        'other_users' => wp_list_pluck($existingUsers, 'user_id'),
+                        'automation_score' => $automationData['confidence'] ?? 0
+                    ], 'user');
+                }
+            }
+            
+            // Update automation score in user_info if high
+            if (($automationData['confidence'] ?? 0) > 50) {
+                $this->userInfoRepo->updateAutomationScore($userId, $automationData['confidence']);
             }
             
             return $existing->id;
@@ -316,24 +345,90 @@ class DeviceFingerprinter {
             $data['first_seen'] = current_time('mysql');
             
             $wpdb->insert(
-                self::$table,
+                $this->table,
                 $data,
-                ['%d', '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s']
+                $this->getFormatSpecifiers($data)
             );
             
             $insertId = $wpdb->insert_id;
             
-            // If multiple accounts detected, log it
-            if ($multipleAccounts && class_exists('\\BCCTrust\\Security\\AuditLogger')) {
-                AuditLogger::log('device_sharing_detected', $userId, [
-                    'fingerprint' => $fingerprint,
-                    'other_users' => wp_list_pluck($existingUsers, 'user_id'),
-                    'automation_score' => $automationData['confidence'] ?? 0
-                ], 'user');
+            // If multiple accounts detected, update user_info
+            if ($multipleAccounts) {
+                $this->userInfoRepo->incrementFraudScore($userId, 10, 'device_sharing');
+                
+                if (class_exists('\\BCCTrust\\Security\\AuditLogger')) {
+                    AuditLogger::log('device_sharing_detected', $userId, [
+                        'fingerprint' => $fingerprint,
+                        'other_users' => wp_list_pluck($existingUsers, 'user_id'),
+                        'automation_score' => $automationData['confidence'] ?? 0
+                    ], 'user');
+                }
+            }
+            
+            // Update automation score in user_info if high
+            if (($automationData['confidence'] ?? 0) > 50) {
+                $this->userInfoRepo->updateAutomationScore($userId, $automationData['confidence']);
+            }
+            
+            // ENHANCEMENT: Store detailed fraud analysis in new table
+            if ($this->fraudAnalysisRepo && ($multipleAccounts || ($automationData['confidence'] ?? 0) > 50)) {
+                $triggers = [];
+                if ($multipleAccounts) {
+                    $triggers[] = 'device_sharing';
+                }
+                if (($automationData['confidence'] ?? 0) > 70) {
+                    $triggers[] = 'high_automation';
+                } elseif (($automationData['confidence'] ?? 0) > 50) {
+                    $triggers[] = 'medium_automation';
+                }
+                
+                $this->fraudAnalysisRepo->storeAnalysis($userId, [
+                    'fraud_score' => $automationData['confidence'] ?? 0,
+                    'risk_level' => $riskLevel,
+                    'confidence' => ($automationData['confidence'] ?? 0) / 100,
+                    'triggers' => $triggers,
+                    'details' => [
+                        'fingerprint' => $fingerprint,
+                        'automation_signals' => $automationData['signals'] ?? [],
+                        'multiple_accounts' => $multipleAccounts,
+                        'other_users' => wp_list_pluck($existingUsers, 'user_id')
+                    ]
+                ]);
             }
             
             return $insertId;
         }
+    }
+    
+    /**
+     * Get format specifiers for database operations
+     */
+    private function getFormatSpecifiers(array $data): array {
+        $formats = [];
+        
+        foreach (array_keys($data) as $field) {
+            switch ($field) {
+                case 'user_id':
+                case 'automation_score':
+                    $formats[] = '%d';
+                    break;
+                case 'fingerprint':
+                case 'automation_signals':
+                case 'first_seen':
+                case 'last_seen':
+                case 'user_agent':
+                case 'risk_level':
+                    $formats[] = '%s';
+                    break;
+                case 'ip_address':
+                    $formats[] = '%s'; // VARBINARY as string
+                    break;
+                default:
+                    $formats[] = '%s';
+            }
+        }
+        
+        return $formats;
     }
     
     /**
@@ -345,12 +440,8 @@ class DeviceFingerprinter {
     public function getFingerprintUserCount(string $fingerprint): int {
         global $wpdb;
         
-        if (!self::$table) {
-            self::$table = $wpdb->prefix . 'bcc_trust_device_fingerprints';
-        }
-        
         return (int) $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(DISTINCT user_id) FROM " . self::$table . " 
+            "SELECT COUNT(DISTINCT user_id) FROM {$this->table} 
              WHERE fingerprint = %s",
             $fingerprint
         ));
@@ -365,13 +456,9 @@ class DeviceFingerprinter {
     public function getUsersByFingerprint(string $fingerprint): array {
         global $wpdb;
         
-        if (!self::$table) {
-            self::$table = $wpdb->prefix . 'bcc_trust_device_fingerprints';
-        }
-        
         return $wpdb->get_results($wpdb->prepare(
             "SELECT DISTINCT user_id, first_seen, last_seen, automation_score, risk_level
-             FROM " . self::$table . " 
+             FROM {$this->table} 
              WHERE fingerprint = %s
              ORDER BY last_seen DESC",
             $fingerprint
@@ -387,12 +474,8 @@ class DeviceFingerprinter {
     public function getUserFingerprints(int $userId): array {
         global $wpdb;
         
-        if (!self::$table) {
-            self::$table = $wpdb->prefix . 'bcc_trust_device_fingerprints';
-        }
-        
         return $wpdb->get_results($wpdb->prepare(
-            "SELECT * FROM " . self::$table . " 
+            "SELECT * FROM {$this->table} 
              WHERE user_id = %d
              ORDER BY last_seen DESC",
             $userId
@@ -578,7 +661,7 @@ class DeviceFingerprinter {
     }
     
     /**
-     * Clean up old fingerprint records - FIXED
+     * Clean up old fingerprint records
      * 
      * @param int $days Keep records for this many days
      * @return int Number of deleted records
@@ -586,45 +669,38 @@ class DeviceFingerprinter {
     public static function cleanOldRecords(int $days = 90): int {
         global $wpdb;
         
-        // Ensure table name is set
-        if (!self::$table) {
-            self::$table = $wpdb->prefix . 'bcc_trust_device_fingerprints';
-        }
-        
+        $table = self::getTable();
         $cutoff = date('Y-m-d H:i:s', strtotime("-{$days} days"));
         
         return $wpdb->query(
             $wpdb->prepare(
-                "DELETE FROM " . self::$table . " WHERE last_seen < %s",
+                "DELETE FROM {$table} WHERE last_seen < %s",
                 $cutoff
             )
         );
     }
     
     /**
-     * Get statistics about fingerprints - FIXED
+     * Get statistics about fingerprints
      * 
      * @return array
      */
     public static function getStats(): array {
         global $wpdb;
         
-        // Ensure table name is set
-        if (!self::$table) {
-            self::$table = $wpdb->prefix . 'bcc_trust_device_fingerprints';
-        }
+        $table = self::getTable();
         
-        $total = (int) $wpdb->get_var("SELECT COUNT(*) FROM " . self::$table);
-        $uniqueUsers = (int) $wpdb->get_var("SELECT COUNT(DISTINCT user_id) FROM " . self::$table);
-        $uniqueFingerprints = (int) $wpdb->get_var("SELECT COUNT(DISTINCT fingerprint) FROM " . self::$table);
+        $total = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$table}");
+        $uniqueUsers = (int) $wpdb->get_var("SELECT COUNT(DISTINCT user_id) FROM {$table}");
+        $uniqueFingerprints = (int) $wpdb->get_var("SELECT COUNT(DISTINCT fingerprint) FROM {$table}");
         
-        $automated = (int) $wpdb->get_var("SELECT COUNT(*) FROM " . self::$table . " WHERE automation_score > 50");
-        $highRisk = (int) $wpdb->get_var("SELECT COUNT(*) FROM " . self::$table . " WHERE risk_level = 'high'");
+        $automated = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$table} WHERE automation_score > 50");
+        $highRisk = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$table} WHERE risk_level = 'high'");
         
         $sharedDevices = (int) $wpdb->get_var("
             SELECT COUNT(*) FROM (
                 SELECT fingerprint, COUNT(DISTINCT user_id) as user_count
-                FROM " . self::$table . "
+                FROM {$table}
                 GROUP BY fingerprint
                 HAVING user_count > 1
             ) as shared

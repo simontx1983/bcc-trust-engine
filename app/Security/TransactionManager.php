@@ -2,6 +2,7 @@
 namespace BCCTrust\Security;
 
 use Exception;
+use Throwable;
 
 if (!defined('ABSPATH')) {
     exit;
@@ -51,7 +52,7 @@ class TransactionManager {
 
                 return $result;
 
-            } catch (Exception $e) {
+            } catch (Throwable $e) { // Catch both Exception and Error
                 // Rollback on error
                 $wpdb->query('ROLLBACK');
                 
@@ -101,7 +102,7 @@ class TransactionManager {
             $result = $callback();
             $wpdb->query('COMMIT');
             return $result;
-        } catch (Exception $e) {
+        } catch (Throwable $e) {
             $wpdb->query('ROLLBACK');
             throw $e;
         }
@@ -110,12 +111,12 @@ class TransactionManager {
     /**
      * Detect MySQL deadlock or lock timeout
      */
-    private static function isDeadlock(Exception $e): bool {
+    private static function isDeadlock(Throwable $e): bool {
         $message = $e->getMessage();
         $code = $e->getCode();
 
         // Check error codes
-        if (in_array($code, [1213, 1205, '1213', '1205'])) {
+        if (in_array($code, [1213, 1205, '1213', '1205', 40001])) { // 40001 is serialization failure
             return true;
         }
 
@@ -126,7 +127,9 @@ class TransactionManager {
             'Lock wait timeout',
             'try restarting transaction',
             '1213',
-            '1205'
+            '1205',
+            '40001',
+            'serialization failure'
         ];
 
         foreach ($deadlockPatterns as $pattern) {
@@ -149,13 +152,19 @@ class TransactionManager {
             ? $table 
             : $wpdb->prefix . $table;
 
+        // Verify table exists to prevent errors
+        $tableExists = $wpdb->get_var("SHOW TABLES LIKE '{$fullTable}'") === $fullTable;
+        if (!$tableExists) {
+            throw new Exception("Table '{$fullTable}' does not exist");
+        }
+
         $wpdb->query("LOCK TABLES {$fullTable} WRITE");
 
         try {
             $result = $callback();
             $wpdb->query('UNLOCK TABLES');
             return $result;
-        } catch (Exception $e) {
+        } catch (Throwable $e) {
             $wpdb->query('UNLOCK TABLES');
             throw $e;
         }
@@ -173,6 +182,12 @@ class TransactionManager {
                 ? $table 
                 : $wpdb->prefix . $table;
             
+            // Verify table exists
+            $tableExists = $wpdb->get_var("SHOW TABLES LIKE '{$fullTable}'") === $fullTable;
+            if (!$tableExists) {
+                throw new Exception("Table '{$fullTable}' does not exist");
+            }
+            
             $lockType = in_array(strtoupper($type), ['READ', 'WRITE']) 
                 ? strtoupper($type) 
                 : 'WRITE';
@@ -186,7 +201,7 @@ class TransactionManager {
             $result = $callback();
             $wpdb->query('UNLOCK TABLES');
             return $result;
-        } catch (Exception $e) {
+        } catch (Throwable $e) {
             $wpdb->query('UNLOCK TABLES');
             throw $e;
         }
@@ -198,12 +213,15 @@ class TransactionManager {
     public static function savepoint(string $name, callable $callback) {
         global $wpdb;
 
+        // Sanitize savepoint name to prevent SQL injection
+        $name = preg_replace('/[^a-zA-Z0-9_]/', '', $name);
+        
         $wpdb->query("SAVEPOINT {$name}");
 
         try {
             $result = $callback();
             return $result;
-        } catch (Exception $e) {
+        } catch (Throwable $e) {
             $wpdb->query("ROLLBACK TO SAVEPOINT {$name}");
             throw $e;
         }
@@ -219,5 +237,38 @@ class TransactionManager {
         $inTransaction = $wpdb->get_var("SELECT @@in_transaction");
         
         return (bool) $inTransaction;
+    }
+
+    /**
+     * Get transaction isolation level
+     */
+    public static function getIsolationLevel(): string {
+        global $wpdb;
+        
+        $level = $wpdb->get_var("SELECT @@transaction_isolation");
+        
+        return $level ?: 'REPEATABLE-READ';
+    }
+
+    /**
+     * Set transaction isolation level for current session
+     */
+    public static function setIsolationLevel(string $level): bool {
+        global $wpdb;
+        
+        $validLevels = [
+            'READ UNCOMMITTED',
+            'READ COMMITTED',
+            'REPEATABLE READ',
+            'SERIALIZABLE'
+        ];
+        
+        if (!in_array(strtoupper($level), $validLevels)) {
+            return false;
+        }
+        
+        $wpdb->query("SET SESSION TRANSACTION ISOLATION LEVEL {$level}");
+        
+        return true;
     }
 }

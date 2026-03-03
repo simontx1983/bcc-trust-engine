@@ -5,7 +5,7 @@
  * Handles database operations for page trust scores using PageScore value objects
  * 
  * @package BCCTrust\Repositories
- * @version 2.0.0
+ * @version 2.1.0
  */
 
 namespace BCCTrust\Repositories;
@@ -24,8 +24,7 @@ class ScoreRepository {
     private string $table;
 
     public function __construct() {
-        global $wpdb;
-        $this->table = $wpdb->prefix . 'bcc_trust_page_scores';
+        $this->table = bcc_trust_scores_table();
     }
 
     /**
@@ -56,7 +55,7 @@ class ScoreRepository {
     }
 
     /**
-     * Get score with page data - FIXED: Return as object with extra data, not modifying PageScore
+     * Get score with page data
      */
     public function getWithPageData(int $pageId): ?object {
         global $wpdb;
@@ -65,7 +64,7 @@ class ScoreRepository {
             $wpdb->prepare(
                 "SELECT s.*, p.post_title, p.post_author, p.post_status
                  FROM {$this->table} s
-                 JOIN {$wpdb->posts} p ON s.page_id = p.ID
+                 LEFT JOIN {$wpdb->posts} p ON s.page_id = p.ID
                  WHERE s.page_id = %d",
                 $pageId
             )
@@ -89,6 +88,7 @@ class ScoreRepository {
         $result->endorsement_count = (int) $row->endorsement_count;
         $result->last_vote_at = $row->last_vote_at;
         $result->last_calculated_at = $row->last_calculated_at;
+        $result->fraud_metadata = $row->fraud_metadata;
         $result->post_title = $row->post_title;
         $result->post_author = (int) $row->post_author;
         $result->post_status = $row->post_status;
@@ -107,25 +107,47 @@ class ScoreRepository {
         $result = $wpdb->replace(
             $this->table,
             $data,
-            [
-                '%d', // page_id
-                '%d', // page_owner_id
-                '%f', // total_score
-                '%f', // positive_score
-                '%f', // negative_score
-                '%d', // vote_count
-                '%d', // unique_voters
-                '%f', // confidence_score
-                '%s', // reputation_tier
-                '%d', // endorsement_count
-                '%s', // last_vote_at
-                '%s'  // last_calculated_at
-            ]
+            $this->getFormatSpecifiers($data)
         );
 
         if ($result === false) {
             throw new Exception('Failed to save page score to database');
         }
+    }
+
+    /**
+     * Get format specifiers for database operations
+     */
+    private function getFormatSpecifiers(array $data): array {
+        $formats = [];
+        
+        foreach (array_keys($data) as $field) {
+            switch ($field) {
+                case 'page_id':
+                case 'page_owner_id':
+                case 'vote_count':
+                case 'unique_voters':
+                case 'endorsement_count':
+                    $formats[] = '%d';
+                    break;
+                case 'total_score':
+                case 'positive_score':
+                case 'negative_score':
+                case 'confidence_score':
+                    $formats[] = '%f';
+                    break;
+                case 'reputation_tier':
+                case 'last_vote_at':
+                case 'last_calculated_at':
+                case 'fraud_metadata':
+                    $formats[] = '%s';
+                    break;
+                default:
+                    $formats[] = '%s';
+            }
+        }
+        
+        return $formats;
     }
 
     /**
@@ -195,13 +217,15 @@ class ScoreRepository {
     }
 
     /**
-     * Get top scored pages - FIXED: Return as objects with extra data
+     * Get top scored pages
      */
     public function getTopScored(int $limit = 10, string $orderBy = 'total_score'): array {
         global $wpdb;
 
-        $allowedOrders = ['total_score', 'confidence_score', 'vote_count'];
-        $orderBy = in_array($orderBy, $allowedOrders) ? $orderBy : 'total_score';
+        $allowedOrders = ['total_score', 'confidence_score', 'vote_count', 'positive_score'];
+        if (!in_array($orderBy, $allowedOrders)) {
+            $orderBy = 'total_score';
+        }
 
         $results = $wpdb->get_results(
             $wpdb->prepare(
@@ -209,7 +233,7 @@ class ScoreRepository {
                  FROM {$this->table} s
                  LEFT JOIN {$wpdb->posts} p ON s.page_id = p.ID
                  LEFT JOIN {$wpdb->users} u ON s.page_owner_id = u.ID
-                 WHERE p.post_status = 'publish' OR p.post_status IS NULL
+                 WHERE (p.post_status = 'publish' OR p.post_status IS NULL)
                  ORDER BY s.{$orderBy} DESC
                  LIMIT %d",
                 $limit
@@ -231,6 +255,7 @@ class ScoreRepository {
             $result->vote_count = $score->getVoteCount();
             $result->endorsement_count = $score->getEndorsementCount();
             $result->confidence_score = $score->getConfidenceScore();
+            $result->has_fraud_alerts = $score->hasFraudAlerts();
             
             $scores[] = $result;
         }
@@ -239,7 +264,7 @@ class ScoreRepository {
     }
 
     /**
-     * Get pages by tier - FIXED: Return as objects with extra data
+     * Get pages by tier
      */
     public function getByTier(string $tier, int $limit = 10, int $offset = 0): array {
         global $wpdb;
@@ -278,6 +303,7 @@ class ScoreRepository {
             $result->vote_count = $score->getVoteCount();
             $result->endorsement_count = $score->getEndorsementCount();
             $result->confidence_score = $score->getConfidenceScore();
+            $result->has_fraud_alerts = $score->hasFraudAlerts();
             
             $scores[] = $result;
         }
@@ -303,7 +329,7 @@ class ScoreRepository {
     }
 
     /**
-     * Get pages by owner - FIXED: Return as objects with extra data
+     * Get pages by owner
      */
     public function getByOwnerId(int $ownerId): array {
         global $wpdb;
@@ -333,6 +359,45 @@ class ScoreRepository {
             $result->vote_count = $score->getVoteCount();
             $result->endorsement_count = $score->getEndorsementCount();
             $result->confidence_score = $score->getConfidenceScore();
+            $result->has_fraud_alerts = $score->hasFraudAlerts();
+            
+            $scores[] = $result;
+        }
+
+        return $scores;
+    }
+
+    /**
+     * Get pages with fraud alerts
+     */
+    public function getPagesWithFraudAlerts(int $limit = 50): array {
+        global $wpdb;
+
+        $results = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT s.*, p.post_title
+                 FROM {$this->table} s
+                 LEFT JOIN {$wpdb->posts} p ON s.page_id = p.ID
+                 WHERE s.fraud_metadata IS NOT NULL 
+                 AND s.fraud_metadata != ''
+                 AND s.fraud_metadata LIKE '%\"alerts\":[%'
+                 ORDER BY s.last_calculated_at DESC
+                 LIMIT %d",
+                $limit
+            )
+        );
+
+        $scores = [];
+        foreach ($results as $row) {
+            $score = PageScore::fromDatabaseRow($row);
+            
+            $result = new stdClass();
+            $result->score = $score;
+            $result->post_title = $row->post_title;
+            $result->page_id = $score->getPageId();
+            $result->total_score = $score->getTotalScore();
+            $result->reputation_tier = $score->getReputationTier();
+            $result->fraud_alert_count = $score->getFraudAlertCount();
             
             $scores[] = $result;
         }
@@ -358,7 +423,8 @@ class ScoreRepository {
                 COUNT(CASE WHEN reputation_tier = 'trusted' THEN 1 END) as trusted_count,
                 COUNT(CASE WHEN reputation_tier = 'neutral' THEN 1 END) as neutral_count,
                 COUNT(CASE WHEN reputation_tier = 'caution' THEN 1 END) as caution_count,
-                COUNT(CASE WHEN reputation_tier = 'risky' THEN 1 END) as risky_count
+                COUNT(CASE WHEN reputation_tier = 'risky' THEN 1 END) as risky_count,
+                COUNT(CASE WHEN fraud_metadata IS NOT NULL AND fraud_metadata != '' THEN 1 END) as pages_with_fraud_alerts
              FROM {$this->table}"
         );
     }
@@ -386,6 +452,26 @@ class ScoreRepository {
     }
 
     /**
+     * Update fraud metadata
+     */
+    public function updateFraudMetadata(int $pageId, array $fraudMetadata): bool {
+        global $wpdb;
+        
+        $result = $wpdb->update(
+            $this->table,
+            [
+                'fraud_metadata' => json_encode($fraudMetadata),
+                'last_calculated_at' => current_time('mysql')
+            ],
+            ['page_id' => $pageId],
+            ['%s', '%s'],
+            ['%d']
+        );
+        
+        return $result !== false;
+    }
+
+    /**
      * Delete score (for page deletion)
      */
     public function delete(int $pageId): bool {
@@ -398,5 +484,26 @@ class ScoreRepository {
         );
         
         return $result !== false;
+    }
+
+    /**
+     * Bulk update scores
+     */
+    public function bulkUpdate(array $scores): int {
+        $updated = 0;
+        
+        foreach ($scores as $score) {
+            if ($score instanceof PageScore) {
+                try {
+                    $this->save($score);
+                    $updated++;
+                } catch (Exception $e) {
+                    // Log error but continue
+                    error_log('Failed to update score for page ' . $score->getPageId() . ': ' . $e->getMessage());
+                }
+            }
+        }
+        
+        return $updated;
     }
 }

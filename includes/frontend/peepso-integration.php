@@ -4,7 +4,7 @@
  * 
  * @package BCC_Trust_Engine
  * @subpackage Frontend
- * @version 1.0.0
+ * @version 2.0.0
  */
 
 if (!defined('ABSPATH')) {
@@ -12,6 +12,36 @@ if (!defined('ABSPATH')) {
 }
 
 class BCC_PeepSo_Pages_Integration {
+    
+    /**
+     * @var \BCCTrust\Repositories\ScoreRepository
+     */
+    private static $scoreRepo;
+    
+    /**
+     * @var \BCCTrust\Repositories\UserInfoRepository
+     */
+    private static $userInfoRepo;
+    
+    /**
+     * Initialize repositories
+     */
+    private static function init_repositories() {
+        if (!self::$scoreRepo) {
+            self::$scoreRepo = new \BCCTrust\Repositories\ScoreRepository();
+        }
+        if (!self::$userInfoRepo) {
+            self::$userInfoRepo = new \BCCTrust\Repositories\UserInfoRepository();
+        }
+    }
+    
+    /**
+     * Get UserInfoRepo instance
+     */
+    private static function getUserInfoRepo() {
+        self::init_repositories();
+        return self::$userInfoRepo;
+    }
     
     /**
      * Check if PeepSo Pages extension is active
@@ -23,13 +53,22 @@ class BCC_PeepSo_Pages_Integration {
     }
     
     /**
+     * Get PeepSo pages table name
+     */
+    private static function get_pages_table() {
+        global $wpdb;
+        return $wpdb->prefix . 'peepso_pages';
+    }
+    
+    /**
      * Get page data with trust score
      */
     public static function get_page_with_trust_score($page_id) {
+        self::init_repositories();
         global $wpdb;
         
         // Get PeepSo page data
-        $pages_table = $wpdb->prefix . 'peepso_pages';
+        $pages_table = self::get_pages_table();
         $page = $wpdb->get_row($wpdb->prepare(
             "SELECT * FROM {$pages_table} WHERE ID = %d",
             $page_id
@@ -39,12 +78,8 @@ class BCC_PeepSo_Pages_Integration {
             return null;
         }
         
-        // Get trust score
-        $scores_table = bcc_trust_scores_table();
-        $score = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$scores_table} WHERE page_id = %d",
-            $page_id
-        ));
+        // Get trust score using repository
+        $score = self::$scoreRepo->getByPageId($page_id);
         
         // Get page owner
         $page_owner = bcc_trust_get_page_owner($page_id);
@@ -52,7 +87,8 @@ class BCC_PeepSo_Pages_Integration {
         return (object) array(
             'page' => $page,
             'trust_score' => $score ?: self::get_default_score($page_id, $page_owner),
-            'owner_id' => $page_owner
+            'owner_id' => $page_owner,
+            'score_api' => $score ? $score->toApiResponse() : null
         );
     }
     
@@ -60,18 +96,23 @@ class BCC_PeepSo_Pages_Integration {
      * Get default score for new page
      */
     private static function get_default_score($page_id, $owner_id) {
+        // Use the value object to create default
+        $score = \BCCTrust\ValueObjects\PageScore::createDefault($page_id, $owner_id);
+        
+        // Convert to legacy object format for compatibility
         return (object) array(
-            'page_id' => $page_id,
-            'page_owner_id' => $owner_id,
-            'total_score' => 50.00,
-            'positive_score' => 0,
-            'negative_score' => 0,
-            'vote_count' => 0,
-            'unique_voters' => 0,
-            'confidence_score' => 0,
-            'reputation_tier' => 'neutral',
-            'endorsement_count' => 0,
-            'last_calculated_at' => current_time('mysql')
+            'page_id' => $score->getPageId(),
+            'page_owner_id' => $score->getPageOwnerId(),
+            'total_score' => $score->getTotalScore(),
+            'positive_score' => $score->getPositiveScore(),
+            'negative_score' => $score->getNegativeScore(),
+            'vote_count' => $score->getVoteCount(),
+            'unique_voters' => $score->getUniqueVoters(),
+            'confidence_score' => $score->getConfidenceScore(),
+            'reputation_tier' => $score->getReputationTier(),
+            'endorsement_count' => $score->getEndorsementCount(),
+            'last_calculated_at' => $score->getLastCalculatedAt()->format('Y-m-d H:i:s'),
+            'has_fraud_alerts' => $score->hasFraudAlerts()
         );
     }
     
@@ -97,8 +138,11 @@ class BCC_PeepSo_Pages_Integration {
                     $score = $score_data->trust_score;
                     $tier_info = bcc_trust_get_tier_info($score->reputation_tier);
                     ?>
-                    <div class="bcc-page-trust-badge" style="display: inline-block; margin-left: 10px; padding: 3px 8px; border-radius: 3px; background: <?php echo $tier_info['color']; ?>; color: #fff; font-size: 12px;">
-                        <?php echo $tier_info['icon']; ?> <?php echo number_format($score->total_score, 1); ?> (<?php echo $tier_info['label']; ?>)
+                    <div class="bcc-page-trust-badge" style="display: inline-block; margin-left: 10px; padding: 3px 8px; border-radius: 3px; background: <?php echo esc_attr($tier_info['color']); ?>; color: #fff; font-size: 12px;">
+                        <?php echo $tier_info['icon']; ?> <?php echo number_format($score->total_score, 1); ?> (<?php echo esc_html($tier_info['label']); ?>)
+                        <?php if ($score->has_fraud_alerts ?? false): ?>
+                            <span style="margin-left: 5px; background: rgba(255,255,255,0.3); padding: 2px 4px; border-radius: 2px;">⚠️</span>
+                        <?php endif; ?>
                     </div>
                     <?php
                 }
@@ -110,20 +154,29 @@ class BCC_PeepSo_Pages_Integration {
      * Hook into PeepSo page creation
      */
     public static function handle_page_creation($page_id, $user_id) {
-        // Initialize trust score for new page
-        $scores_table = bcc_trust_scores_table();
-        global $wpdb;
+        self::init_repositories();
         
-        $wpdb->insert(
-            $scores_table,
-            array(
-                'page_id' => $page_id,
-                'page_owner_id' => $user_id,
-                'total_score' => 50.00,
-                'last_calculated_at' => current_time('mysql')
-            ),
-            array('%d', '%d', '%f', '%s')
-        );
+        // Use repository to create default score
+        try {
+            $score = self::$scoreRepo->createDefault($page_id, $user_id);
+            
+            // Update user's page count in user_info table
+            self::$userInfoRepo->incrementPageCount($user_id, $page_id);
+            
+            // Log the creation
+            if (function_exists('bcc_trust_log_audit')) {
+                bcc_trust_log_audit('page_created', [
+                    'page_id' => $page_id,
+                    'user_id' => $user_id,
+                    'action' => 'create'
+                ]);
+            }
+            
+        } catch (Exception $e) {
+            if (defined('WP_DEBUG') && WP_DEBUG) {
+                error_log('BCC Trust: Failed to initialize page score - ' . $e->getMessage());
+            }
+        }
     }
     
     /**
@@ -184,10 +237,26 @@ add_action('peepso_page_after_create', array('BCC_PeepSo_Pages_Integration', 'ha
 
 // Hook into page deletion
 add_action('peepso_page_after_delete', function($page_id) {
+    BCC_PeepSo_Pages_Integration::init_repositories();
     global $wpdb;
+    
+    // Get page owner before deletion
     $scores_table = bcc_trust_scores_table();
+    $owner_id = $wpdb->get_var($wpdb->prepare(
+        "SELECT page_owner_id FROM {$scores_table} WHERE page_id = %d",
+        $page_id
+    ));
+    
+    // Delete from scores table
     $wpdb->delete($scores_table, ['page_id' => $page_id], ['%d']);
+    
+    // Update user's page count if owner found
+    if ($owner_id) {
+        BCC_PeepSo_Pages_Integration::getUserInfoRepo()->decrementPageCount($owner_id, $page_id);
+    }
 });
+
+// Note: bcc_trust_get_userInfoRepo() function removed from here - now in helpers.php
 
 /**
  * Handle page creation from the frontend dialog
@@ -200,53 +269,10 @@ function bcc_trust_handle_page_creation($page_id, $data) {
         return;
     }
     
-    global $wpdb;
-    
-    $scoresTable = bcc_trust_scores_table();
-    $userInfoTable = bcc_trust_user_info_table();
-    
-    // Get the page owner (usually current user)
     $owner_id = get_current_user_id();
     
-    // Check if page already has a score entry
-    $exists = $wpdb->get_var($wpdb->prepare(
-        "SELECT id FROM {$scoresTable} WHERE page_id = %d",
-        $page_id
-    ));
-    
-    if (!$exists) {
-        // Initialize trust score for the new page
-        $wpdb->insert(
-            $scoresTable,
-            [
-                'page_id' => $page_id,
-                'page_owner_id' => $owner_id,
-                'total_score' => 50.00, // Start at neutral
-                'positive_score' => 0,
-                'negative_score' => 0,
-                'vote_count' => 0,
-                'unique_voters' => 0,
-                'confidence_score' => 0.5,
-                'reputation_tier' => 'neutral',
-                'endorsement_count' => 0,
-                'last_calculated_at' => current_time('mysql')
-            ],
-            [
-                '%d', '%d', '%f', '%f', '%f', 
-                '%d', '%d', '%f', '%s', '%d', '%s'
-            ]
-        );
-        
-        // Log the creation
-        bcc_trust_log_audit('page_created', [
-            'page_id' => $page_id,
-            'user_id' => $owner_id,
-            'action' => 'create'
-        ]);
-        
-        // Update user's page count in user_info table
-        bcc_trust_increment_user_page_count($owner_id);
-    }
+    // Use the integration class to handle creation
+    BCC_PeepSo_Pages_Integration::handle_page_creation($page_id, $owner_id);
 }
 
 /**
@@ -254,7 +280,7 @@ function bcc_trust_handle_page_creation($page_id, $data) {
  */
 function bcc_trust_handle_ajax_page_creation() {
     // Check nonce
-    if (!wp_verify_nonce($_POST['_wpnonce'], 'peepso_page_create')) {
+    if (!isset($_POST['_wpnonce']) || !wp_verify_nonce($_POST['_wpnonce'], 'peepso_page_create')) {
         return;
     }
     
@@ -295,6 +321,11 @@ function bcc_trust_handle_page_save($post_id, $post, $update) {
         return;
     }
     
+    // Check if this is a PeepSo page post type
+    if ($post->post_type !== 'peepso-page') {
+        return;
+    }
+    
     // Check if this is a new page or update
     if (!$update) {
         // New page created in admin
@@ -305,7 +336,7 @@ function bcc_trust_handle_page_save($post_id, $post, $update) {
         $new_owner = $post->post_author;
         
         if ($old_owner && $old_owner != $new_owner) {
-            bcc_trust_handle_owner_change($page_id, $new_owner);
+            bcc_trust_handle_owner_change($post_id, $new_owner);
         }
     }
 }
@@ -317,7 +348,7 @@ function bcc_trust_handle_owner_change($page_id, $new_owner_id) {
     global $wpdb;
     
     $scoresTable = bcc_trust_scores_table();
-    $userInfoTable = bcc_trust_user_info_table();
+    $userInfoRepo = bcc_trust_get_userInfoRepo(); // This now comes from helpers.php
     
     // Get old owner
     $old_owner = $wpdb->get_var($wpdb->prepare(
@@ -325,7 +356,7 @@ function bcc_trust_handle_owner_change($page_id, $new_owner_id) {
         $page_id
     ));
     
-    if ($old_owner) {
+    if ($old_owner && $old_owner != $new_owner_id) {
         // Update page owner in scores table
         $wpdb->update(
             $scoresTable,
@@ -335,18 +366,17 @@ function bcc_trust_handle_owner_change($page_id, $new_owner_id) {
             ['%d']
         );
         
-        // Decrement old owner's page count
-        if ($old_owner != $new_owner_id) {
-            bcc_trust_decrement_user_page_count($old_owner);
-            bcc_trust_increment_user_page_count($new_owner_id);
-        }
+        // Update page ownership in user_info table
+        $userInfoRepo->transferPageOwnership($old_owner, $new_owner_id, $page_id);
         
         // Log the change
-        bcc_trust_log_audit('page_owner_changed', [
-            'page_id' => $page_id,
-            'old_owner' => $old_owner,
-            'new_owner' => $new_owner_id
-        ]);
+        if (function_exists('bcc_trust_log_audit')) {
+            bcc_trust_log_audit('page_owner_changed', [
+                'page_id' => $page_id,
+                'old_owner' => $old_owner,
+                'new_owner' => $new_owner_id
+            ]);
+        }
     }
 }
 
@@ -354,46 +384,45 @@ function bcc_trust_handle_owner_change($page_id, $new_owner_id) {
  * Helper: Increment user page count
  */
 function bcc_trust_increment_user_page_count($user_id) {
-    global $wpdb;
+    $repo = bcc_trust_get_userInfoRepo(); // This now comes from helpers.php
     
-    $userInfoTable = bcc_trust_user_info_table();
-    
-    // Update the user's page count
-    $wpdb->query($wpdb->prepare(
-        "UPDATE {$userInfoTable} SET pages_owned = pages_owned + 1 WHERE user_id = %d",
-        $user_id
-    ));
-    
-    // Also update the page_ids_owned JSON if needed
-    $user_info = $wpdb->get_row($wpdb->prepare(
-        "SELECT page_ids_owned FROM {$userInfoTable} WHERE user_id = %d",
-        $user_id
-    ));
-    
-    if ($user_info) {
-        $page_ids = [];
-        if (!empty($user_info->page_ids_owned)) {
-            $page_ids = json_decode($user_info->page_ids_owned, true);
-            if (!is_array($page_ids)) {
-                $page_ids = [];
-            }
-        }
-        
-        // Note: We don't know the new page ID here yet, so we'll need to handle
-        // this separately after page creation
-    }
+    // Note: We don't know the new page ID here, so this function is kept
+    // for backward compatibility but should be replaced with direct repo calls
+    $repo->incrementPageCount($user_id);
 }
 
 /**
  * Helper: Decrement user page count
  */
 function bcc_trust_decrement_user_page_count($user_id) {
-    global $wpdb;
-    
-    $userInfoTable = bcc_trust_user_info_table();
-    
-    $wpdb->query($wpdb->prepare(
-        "UPDATE {$userInfoTable} SET pages_owned = GREATEST(pages_owned - 1, 0) WHERE user_id = %d",
-        $user_id
-    ));
+    $repo = bcc_trust_get_userInfoRepo(); // This now comes from helpers.php
+    $repo->decrementPageCount($user_id);
 }
+if (!defined('ABSPATH')) exit;
+
+function bcc_label_swap($translated, $text, $domain) {
+
+    // Only target PeepSo-related domains
+    if (
+        $domain !== 'peepso-core' &&
+        $domain !== 'peepso-block-theme' &&
+        $domain !== 'pageso' &&
+        $domain !== 'default'
+    ) {
+        return $translated;
+    }
+
+    if ($text === 'Pages') return 'Projects';
+    if ($text === 'Page') return 'Project';
+    if ($text === 'PeepSo Pages') return 'PeepSo Projects';
+
+    return $translated;
+
+}
+
+
+
+add_filter('gettext', 'bcc_label_swap', 999, 3);
+add_filter('gettext_with_context', function($translated, $text, $context, $domain) {
+    return bcc_label_swap($translated, $text, $domain);
+}, 999, 4);

@@ -3,7 +3,31 @@ namespace BCCTrust\Security;
 
 if (!defined('ABSPATH')) exit;
 
+use BCCTrust\Repositories\UserInfoRepository;
+use BCCTrust\Repositories\FraudAnalysisRepository;
+
 class MLFraudDetector {
+    
+    /**
+     * @var UserInfoRepository
+     */
+    private $userInfoRepo;
+    
+    /**
+     * @var FraudAnalysisRepository
+     */
+    private $fraudAnalysisRepo;
+    
+    /**
+     * Constructor
+     */
+    public function __construct() {
+        $this->userInfoRepo = new UserInfoRepository();
+        
+        if (class_exists('\\BCCTrust\\Repositories\\FraudAnalysisRepository')) {
+            $this->fraudAnalysisRepo = new FraudAnalysisRepository();
+        }
+    }
     
     /**
      * Extract features for ML model
@@ -11,16 +35,23 @@ class MLFraudDetector {
     public function extractFeatures($userId) {
         $features = [];
         
+        // Get user info from user_info table
+        $userInfo = $this->userInfoRepo->getByUserId($userId);
+        
+        if (!$userInfo) {
+            return $this->getDefaultFeatures();
+        }
+        
         // Account features
         $features['account_age_days'] = $this->getAccountAge($userId);
         $features['has_avatar'] = $this->hasAvatar($userId) ? 1 : 0;
         $features['profile_completeness'] = $this->getProfileCompleteness($userId);
-        $features['email_verified'] = (int) get_user_meta($userId, 'bcc_trust_email_verified', true);
+        $features['email_verified'] = $userInfo->is_verified ? 1 : 0;
         $features['posts_count'] = $this->countUserPosts($userId);
         $features['comments_count'] = $this->countUserComments($userId);
         
-        // Voting features
-        $features['total_votes_cast'] = (int) get_user_meta($userId, 'bcc_trust_votes_cast', true);
+        // Voting features from user_info
+        $features['total_votes_cast'] = $userInfo->votes_cast / 100; // Normalize
         $features['upvote_ratio'] = $this->getUpvoteRatio($userId);
         $features['avg_vote_weight'] = $this->getAvgVoteWeight($userId);
         $features['vote_time_variance'] = $this->getVoteTimeVariance($userId);
@@ -34,19 +65,25 @@ class MLFraudDetector {
         $features['uses_proxy'] = $this->detectProxy($userId) ? 1 : 0;
         $features['ip_reputation'] = $this->getIPReputation($userId);
         
-        // Device features
+        // Device features from user_info and fingerprints
         $features['unique_devices'] = $this->countUniqueDevices($userId);
-        $features['automation_score'] = $this->getAutomationScore($userId);
+        $features['automation_score'] = $userInfo->automation_score / 100;
         $features['headless_detected'] = $this->wasHeadlessDetected($userId) ? 1 : 0;
         $features['screen_resolution_consistency'] = $this->getScreenConsistency($userId);
         
-        // Behavioral features
+        // Behavioral features from user_info
         $features['active_hours_per_day'] = $this->getActiveHoursPerDay($userId);
         $features['session_length_avg'] = $this->getAvgSessionLength($userId);
         $features['night_activity_ratio'] = $this->getNightActivityRatio($userId);
         $features['weekend_activity_ratio'] = $this->getWeekendActivityRatio($userId);
         $features['action_interval_avg'] = $this->getAvgActionInterval($userId);
         $features['action_interval_std'] = $this->getActionIntervalStd($userId);
+        
+        // Trust features from user_info
+        $features['trust_rank'] = $userInfo->trust_rank;
+        $features['fraud_score'] = $userInfo->fraud_score / 100;
+        $features['behavior_score'] = $userInfo->behavior_score / 100;
+        $features['risk_level'] = $this->riskLevelToNumeric($userInfo->risk_level);
         
         // Social features
         $features['unique_page_owners'] = $this->countUniquePageOwners($userId);
@@ -55,8 +92,53 @@ class MLFraudDetector {
         $features['followers_count'] = $this->countFollowers($userId);
         $features['following_count'] = $this->countFollowing($userId);
         
+        // Page ownership features
+        $features['pages_owned'] = $userInfo->pages_owned;
+        $features['pages_joined'] = $userInfo->pages_joined;
+        $features['groups_owned'] = $userInfo->groups_owned;
+        $features['groups_joined'] = $userInfo->groups_joined;
+        
         // Normalize features to 0-1 range where appropriate
         return $this->normalizeFeatures($features);
+    }
+    
+    /**
+     * Get default features when user not found
+     */
+    private function getDefaultFeatures(): array {
+        $features = [];
+        $fields = [
+            'account_age_days', 'has_avatar', 'profile_completeness', 'email_verified',
+            'posts_count', 'comments_count', 'total_votes_cast', 'upvote_ratio',
+            'avg_vote_weight', 'vote_time_variance', 'votes_per_session', 'vote_burstiness',
+            'unique_ips_30d', 'ip_country_changes', 'uses_vpn', 'uses_proxy', 'ip_reputation',
+            'unique_devices', 'automation_score', 'headless_detected', 'screen_resolution_consistency',
+            'active_hours_per_day', 'session_length_avg', 'night_activity_ratio', 'weekend_activity_ratio',
+            'action_interval_avg', 'action_interval_std', 'trust_rank', 'fraud_score', 'behavior_score',
+            'risk_level', 'unique_page_owners', 'mutual_voting_count', 'in_vote_ring',
+            'followers_count', 'following_count', 'pages_owned', 'pages_joined',
+            'groups_owned', 'groups_joined'
+        ];
+        
+        foreach ($fields as $field) {
+            $features[$field] = 0;
+        }
+        
+        return $features;
+    }
+    
+    /**
+     * Convert risk level to numeric value
+     */
+    private function riskLevelToNumeric(string $riskLevel): float {
+        switch ($riskLevel) {
+            case 'critical': return 1.0;
+            case 'high': return 0.8;
+            case 'medium': return 0.5;
+            case 'low': return 0.2;
+            case 'minimal': return 0.0;
+            default: return 0.3;
+        }
     }
     
     /**
@@ -68,20 +150,24 @@ class MLFraudDetector {
         
         // Weighted scoring based on feature importance
         $weights = [
-            'automation_score' => 0.15,
-            'uses_vpn' => 0.10,
-            'headless_detected' => 0.15,
-            'vote_time_variance' => 0.08,
-            'vote_burstiness' => 0.08,
-            'unique_ips_30d' => 0.07,
-            'in_vote_ring' => 0.12,
-            'upvote_ratio' => 0.05,
-            'night_activity_ratio' => 0.05,
-            'session_length_avg' => 0.05,
+            'automation_score' => 0.12,
+            'fraud_score' => 0.10,
+            'behavior_score' => 0.10,
+            'trust_rank' => 0.08,
+            'uses_vpn' => 0.08,
+            'headless_detected' => 0.08,
+            'vote_time_variance' => 0.05,
+            'vote_burstiness' => 0.05,
+            'unique_ips_30d' => 0.05,
+            'in_vote_ring' => 0.08,
+            'upvote_ratio' => 0.03,
+            'night_activity_ratio' => 0.03,
+            'session_length_avg' => 0.03,
             'account_age_days' => 0.03,
-            'email_verified' => 0.03,
+            'email_verified' => 0.02,
             'profile_completeness' => 0.02,
-            'followers_count' => 0.02
+            'followers_count' => 0.02,
+            'mutual_voting_count' => 0.03
         ];
         
         $score = 0;
@@ -92,12 +178,29 @@ class MLFraudDetector {
         // Apply sigmoid function to get probability
         $probability = 1 / (1 + exp(-$score));
         
-        return [
+        $result = [
             'probability' => round($probability, 4),
             'risk_level' => $this->getRiskLevel($probability),
             'features' => $features,
             'timestamp' => time()
         ];
+        
+        // Store prediction in fraud_analysis table if repository exists
+        if ($this->fraudAnalysisRepo) {
+            $expiresAt = date('Y-m-d H:i:s', strtotime('+90 days'));
+            
+            $this->fraudAnalysisRepo->storeAnalysis(
+                $userId,
+                (int) round($probability * 100),
+                $result['risk_level'],
+                $probability,
+                ['ml_prediction'],
+                ['ml_score' => $score, 'feature_count' => count($features)],
+                $expiresAt
+            );
+        }
+        
+        return $result;
     }
     
     private function getRiskLevel($probability) {
@@ -295,7 +398,7 @@ class MLFraudDetector {
     
     private function countUniqueDevices($userId) {
         global $wpdb;
-        $fingerprintTable = $wpdb->prefix . 'bcc_trust_device_fingerprints';
+        $fingerprintTable = bcc_trust_fingerprints_table();
         
         return (int) $wpdb->get_var($wpdb->prepare(
             "SELECT COUNT(DISTINCT fingerprint) FROM {$fingerprintTable} WHERE user_id = %d",
@@ -305,7 +408,7 @@ class MLFraudDetector {
     
     private function getAutomationScore($userId) {
         global $wpdb;
-        $fingerprintTable = $wpdb->prefix . 'bcc_trust_device_fingerprints';
+        $fingerprintTable = bcc_trust_fingerprints_table();
         
         $score = $wpdb->get_var($wpdb->prepare(
             "SELECT automation_score FROM {$fingerprintTable} WHERE user_id = %d ORDER BY last_seen DESC LIMIT 1",
@@ -317,7 +420,7 @@ class MLFraudDetector {
     
     private function wasHeadlessDetected($userId) {
         global $wpdb;
-        $fingerprintTable = $wpdb->prefix . 'bcc_trust_device_fingerprints';
+        $fingerprintTable = bcc_trust_fingerprints_table();
         
         $signals = $wpdb->get_var($wpdb->prepare(
             "SELECT automation_signals FROM {$fingerprintTable} WHERE user_id = %d ORDER BY last_seen DESC LIMIT 1",
@@ -464,6 +567,7 @@ class MLFraudDetector {
     
     private function getActionIntervalStd($userId) {
         global $wpdb;
+        $auditTable = bcc_trust_activity_table();
         
         $timestamps = $wpdb->get_col($wpdb->prepare(
             "SELECT UNIX_TIMESTAMP(created_at) FROM {$auditTable}
@@ -531,7 +635,7 @@ class MLFraudDetector {
         $rings = $graph->detectVoteRings();
         
         foreach ($rings as $ring) {
-            if (in_array($userId, $ring)) return true;
+            if (in_array($userId, $ring['users'])) return true;
         }
         return false;
     }
@@ -561,5 +665,46 @@ class MLFraudDetector {
             }
         }
         return $features;
+    }
+    
+    /**
+     * Get batch predictions for multiple users
+     */
+    public function predictBatch(array $userIds): array {
+        $predictions = [];
+        
+        foreach ($userIds as $userId) {
+            $predictions[$userId] = $this->predictFraudProbability($userId);
+        }
+        
+        return $predictions;
+    }
+    
+    /**
+     * Get feature importance ranking
+     */
+    public function getFeatureImportance(): array {
+        // This would come from trained model
+        // For now, return the weights used in prediction
+        return [
+            'automation_score' => 0.12,
+            'fraud_score' => 0.10,
+            'behavior_score' => 0.10,
+            'trust_rank' => 0.08,
+            'uses_vpn' => 0.08,
+            'headless_detected' => 0.08,
+            'in_vote_ring' => 0.08,
+            'vote_time_variance' => 0.05,
+            'vote_burstiness' => 0.05,
+            'unique_ips_30d' => 0.05,
+            'mutual_voting_count' => 0.03,
+            'upvote_ratio' => 0.03,
+            'night_activity_ratio' => 0.03,
+            'session_length_avg' => 0.03,
+            'account_age_days' => 0.03,
+            'email_verified' => 0.02,
+            'profile_completeness' => 0.02,
+            'followers_count' => 0.02
+        ];
     }
 }

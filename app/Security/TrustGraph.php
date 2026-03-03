@@ -3,6 +3,8 @@ namespace BCCTrust\Security;
 
 if (!defined('ABSPATH')) exit;
 
+use BCCTrust\Repositories\UserInfoRepository;
+
 /**
  * Trust Graph Analyzer
  * 
@@ -10,7 +12,7 @@ if (!defined('ABSPATH')) exit;
  * 
  * @package BCCTrust
  * @subpackage Security
- * @version 1.0.0
+ * @version 2.0.0
  */
 class TrustGraph {
     
@@ -21,6 +23,11 @@ class TrustGraph {
     private string $endorseTable;
     private string $scoresTable;
     private string $patternsTable;
+    
+    /**
+     * Repositories
+     */
+    private UserInfoRepository $userInfoRepo;
     
     /**
      * Cache keys
@@ -39,11 +46,11 @@ class TrustGraph {
      * Constructor
      */
     public function __construct() {
-        global $wpdb;
-        $this->votesTable = $wpdb->prefix . 'bcc_trust_votes';
-        $this->endorseTable = $wpdb->prefix . 'bcc_trust_endorsements';
-        $this->scoresTable = $wpdb->prefix . 'bcc_trust_page_scores';
-        $this->patternsTable = $wpdb->prefix . 'bcc_trust_patterns';
+        $this->votesTable = bcc_trust_votes_table();
+        $this->endorseTable = bcc_trust_endorsements_table();
+        $this->scoresTable = bcc_trust_scores_table();
+        $this->patternsTable = bcc_trust_patterns_table();
+        $this->userInfoRepo = new UserInfoRepository();
     }
     
     /**
@@ -181,10 +188,11 @@ class TrustGraph {
             }
         }
         
-        // Store in cache and user meta for quick access
+        // Store in cache
         wp_cache_set('trust_rank_' . $userId, $normalized[$userId], self::CACHE_GROUP, self::CACHE_TTL);
-        update_user_meta($userId, 'bcc_trust_graph_rank', $normalized[$userId]);
-        update_user_meta($userId, 'bcc_trust_graph_updated', time());
+        
+        // Update user_info table instead of user meta
+        $this->userInfoRepo->updateTrustRank($userId, $normalized[$userId]);
         
         // Store top trust ranks for other users (for performance)
         $this->cacheTopTrustRanks($normalized, 100);
@@ -202,7 +210,7 @@ class TrustGraph {
     }
     
     /**
-     * Get trust rank for multiple users at once
+     * Get trust rank for multiple users at once from user_info table
      * 
      * @param array $userIds
      * @return array
@@ -220,15 +228,30 @@ class TrustGraph {
             }
         }
         
-        // Calculate for users not in cache
+        // For users not in cache, try to get from user_info first
         if (!empty($needCalculation)) {
-            // For performance, calculate for the first one and use similar for others
-            // In production, you'd want a more sophisticated batch calculation
-            $sampleRank = $this->calculateTrustRank($needCalculation[0]);
+            $userInfos = $this->userInfoRepo->getBulkByUserIds($needCalculation);
             
+            $stillNeedCalculation = [];
             foreach ($needCalculation as $userId) {
-                $ranks[$userId] = $sampleRank;
-                wp_cache_set('trust_rank_' . $userId, $sampleRank, self::CACHE_GROUP, self::CACHE_TTL);
+                if (isset($userInfos[$userId]) && $userInfos[$userId]->trust_rank > 0) {
+                    $ranks[$userId] = (float) $userInfos[$userId]->trust_rank;
+                    wp_cache_set('trust_rank_' . $userId, $ranks[$userId], self::CACHE_GROUP, self::CACHE_TTL);
+                } else {
+                    $stillNeedCalculation[] = $userId;
+                }
+            }
+            
+            // Calculate for users still missing
+            if (!empty($stillNeedCalculation)) {
+                // For performance, calculate for the first one and use similar for others
+                // In production, you'd want a more sophisticated batch calculation
+                $sampleRank = $this->calculateTrustRank($stillNeedCalculation[0]);
+                
+                foreach ($stillNeedCalculation as $userId) {
+                    $ranks[$userId] = $sampleRank;
+                    wp_cache_set('trust_rank_' . $userId, $sampleRank, self::CACHE_GROUP, self::CACHE_TTL);
+                }
             }
         }
         
@@ -313,6 +336,11 @@ class TrustGraph {
                         
                         // Store pattern for ML
                         $this->storePattern('vote_ring', $component, $strength / 100);
+                        
+                        // Update user_info for ring members (increment fraud score)
+                        foreach ($component as $userId) {
+                            $this->userInfoRepo->incrementFraudScore($userId, 15, 'vote_ring_member');
+                        }
                     }
                 }
             }
@@ -529,8 +557,10 @@ class TrustGraph {
               AND e2.status = 1
         ", $userId, $userId));
         
-        // Get trust rank
-        $trustRank = (float) get_user_meta($userId, 'bcc_trust_graph_rank', true);
+        // Get trust rank from user_info
+        $userInfo = $this->userInfoRepo->getByUserId($userId);
+        $trustRank = $userInfo ? (float) $userInfo->trust_rank : 0;
+        
         if (!$trustRank) {
             $trustRank = $this->calculateTrustRank($userId);
         }
@@ -632,7 +662,7 @@ class TrustGraph {
     }
     
     /**
-     * Get users with high trust (for recommendations)
+     * Get users with high trust (for recommendations) from user_info table
      * 
      * @param int $limit Number of users to return
      * @return array
@@ -646,26 +676,26 @@ class TrustGraph {
             return array_slice($cached, 0, $limit);
         }
         
-        // Get users with highest trust ranks from meta
-        $users = $wpdb->get_results("
-            SELECT user_id, meta_value as trust_rank
-            FROM {$wpdb->usermeta}
-            WHERE meta_key = 'bcc_trust_graph_rank'
-            ORDER BY CAST(meta_value AS DECIMAL) DESC
-            LIMIT 100
-        ");
+        // Query user_info table for high trust ranks
+        $userInfoTable = bcc_trust_user_info_table();
+        
+        $users = $wpdb->get_results($wpdb->prepare("
+            SELECT ui.user_id, ui.trust_rank, u.display_name
+            FROM {$userInfoTable} ui
+            JOIN {$wpdb->users} u ON ui.user_id = u.ID
+            WHERE ui.trust_rank > 0
+            ORDER BY ui.trust_rank DESC
+            LIMIT %d
+        ", 100));
         
         $result = [];
         foreach ($users as $user) {
-            $userData = get_userdata($user->user_id);
-            if ($userData) {
-                $result[] = [
-                    'user_id' => $user->user_id,
-                    'display_name' => $userData->display_name,
-                    'trust_rank' => (float) $user->trust_rank,
-                    'avatar' => get_avatar_url($user->user_id)
-                ];
-            }
+            $result[] = [
+                'user_id' => $user->user_id,
+                'display_name' => $user->display_name,
+                'trust_rank' => (float) $user->trust_rank,
+                'avatar' => get_avatar_url($user->user_id)
+            ];
         }
         
         wp_cache_set('high_trust_users', $result, self::CACHE_GROUP, 3600);
@@ -684,11 +714,13 @@ class TrustGraph {
         
         $suspicious = [];
         foreach ($rings as $ring) {
-            // Calculate average trust rank of ring members
+            // Calculate average trust rank of ring members from user_info
             $totalRank = 0;
+            $userInfos = $this->userInfoRepo->getBulkByUserIds($ring['users']);
+            
             foreach ($ring['users'] as $userId) {
-                $rank = (float) get_user_meta($userId, 'bcc_trust_graph_rank', true);
-                $totalRank += $rank ?: 0.5;
+                $rank = isset($userInfos[$userId]) ? (float) $userInfos[$userId]->trust_rank : 0.5;
+                $totalRank += $rank;
             }
             $avgRank = $totalRank / count($ring['users']);
             
@@ -717,21 +749,21 @@ class TrustGraph {
     }
     
     /**
-     * Get graph statistics
+     * Get graph statistics from user_info table
      */
     public function getStats(): array {
         global $wpdb;
         
-        $totalUsers = $wpdb->get_var("
-            SELECT COUNT(DISTINCT user_id) 
-            FROM {$wpdb->usermeta} 
-            WHERE meta_key = 'bcc_trust_graph_rank'
-        ");
+        $userInfoTable = bcc_trust_user_info_table();
         
-        $avgTrustRank = $wpdb->get_var("
-            SELECT AVG(CAST(meta_value AS DECIMAL))
-            FROM {$wpdb->usermeta}
-            WHERE meta_key = 'bcc_trust_graph_rank'
+        $stats = $wpdb->get_row("
+            SELECT 
+                COUNT(*) as total_users_tracked,
+                AVG(trust_rank) as average_trust_rank,
+                SUM(CASE WHEN trust_rank > 0.8 THEN 1 ELSE 0 END) as high_trust_count,
+                SUM(CASE WHEN trust_rank < 0.2 THEN 1 ELSE 0 END) as low_trust_count
+            FROM {$userInfoTable}
+            WHERE trust_rank > 0
         ");
         
         $rings = $this->detectVoteRings();
@@ -739,8 +771,10 @@ class TrustGraph {
         $usersInRings = array_sum(array_column($rings, 'size'));
         
         return [
-            'total_users_tracked' => (int) $totalUsers,
-            'average_trust_rank' => round((float) $avgTrustRank, 3),
+            'total_users_tracked' => (int) ($stats->total_users_tracked ?? 0),
+            'average_trust_rank' => round((float) ($stats->average_trust_rank ?? 0), 3),
+            'high_trust_users' => (int) ($stats->high_trust_count ?? 0),
+            'low_trust_users' => (int) ($stats->low_trust_count ?? 0),
             'vote_rings_detected' => $totalRings,
             'users_in_rings' => $usersInRings,
             'last_updated' => current_time('mysql')
@@ -756,7 +790,7 @@ class TrustGraph {
     public function analyzePageVoterConcentration(int $pageId): array {
         global $wpdb;
         
-        // Use the class property instead of function
+        // Use the class property
         $votesTable = $this->votesTable;
         
         // Get top 3 voters by weight for this page
@@ -804,10 +838,14 @@ class TrustGraph {
             $risk = 'medium'; // Top 3 voters control >40% of weight
         }
         
-        // Get voter names for better reporting
+        // Get voter names and fraud scores for better reporting
         foreach ($topVoters as &$voter) {
             $user = get_userdata($voter->voter_user_id);
             $voter->display_name = $user ? $user->display_name : 'Unknown';
+            
+            // Get fraud score from user_info
+            $userInfo = $this->userInfoRepo->getByUserId($voter->voter_user_id);
+            $voter->fraud_score = $userInfo ? $userInfo->fraud_score : 0;
         }
         
         return [
@@ -840,6 +878,16 @@ class TrustGraph {
             case 'medium':
                 $penalty = 0.95; // 5% penalty
                 break;
+        }
+        
+        // Log penalty application
+        if ($penalty < 1.0 && class_exists('\\BCCTrust\\Security\\AuditLogger')) {
+            AuditLogger::log('concentration_penalty_applied', $pageId, [
+                'original_score' => $currentScore,
+                'penalty' => $penalty,
+                'new_score' => $currentScore * $penalty,
+                'concentration' => $concentration
+            ], 'page');
         }
         
         return $currentScore * $penalty;

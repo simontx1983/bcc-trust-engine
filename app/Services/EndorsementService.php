@@ -3,10 +3,10 @@
  * Endorsement Service
  *
  * Handles users endorsing PeepSo Pages with enhanced fraud protection
- * Updated to use PageScore value objects
+ * Updated to use PageScore value objects and user_info table
  *
  * @package BCCTrust\Services
- * @version 2.0.0
+ * @version 2.1.0
  */
 
 namespace BCCTrust\Services;
@@ -14,6 +14,8 @@ namespace BCCTrust\Services;
 use Exception;
 use BCCTrust\Repositories\EndorsementRepository;
 use BCCTrust\Repositories\ScoreRepository;
+use BCCTrust\Repositories\UserInfoRepository;
+use BCCTrust\Repositories\VerificationRepository;
 use BCCTrust\Security\TransactionManager;
 use BCCTrust\Security\RateLimiter;
 use BCCTrust\Security\AuditLogger;
@@ -21,7 +23,7 @@ use BCCTrust\Security\FraudDetector;
 use BCCTrust\Security\DeviceFingerprinter;
 use BCCTrust\Security\BehavioralAnalyzer;
 use BCCTrust\Security\TrustGraph;
-use BCCTrust\ValueObjects\PageScore; // ADDED: Value object import
+use BCCTrust\ValueObjects\PageScore;
 
 if (!defined('ABSPATH')) {
     exit;
@@ -31,6 +33,8 @@ class EndorsementService {
 
     private EndorsementRepository $endorseRepo;
     private ScoreRepository $scoreRepo;
+    private UserInfoRepository $userInfoRepo;
+    private VerificationRepository $verificationRepo;
     private DeviceFingerprinter $fingerprinter;
     private BehavioralAnalyzer $behavioralAnalyzer;
     private TrustGraph $trustGraph;
@@ -38,6 +42,8 @@ class EndorsementService {
     public function __construct() {
         $this->endorseRepo = new EndorsementRepository();
         $this->scoreRepo   = new ScoreRepository();
+        $this->userInfoRepo = new UserInfoRepository();
+        $this->verificationRepo = new VerificationRepository();
         $this->fingerprinter = new DeviceFingerprinter();
         $this->behavioralAnalyzer = new BehavioralAnalyzer();
         $this->trustGraph = new TrustGraph();
@@ -112,10 +118,13 @@ class EndorsementService {
         // TRUST GRAPH ANALYSIS
         // ======================================================
 
-        $trustRank = (float) get_user_meta($endorserUserId, 'bcc_trust_graph_rank', true);
+        // Get trust rank from user_info table
+        $userInfo = $this->userInfoRepo->getByUserId($endorserUserId);
+        $trustRank = $userInfo ? (float) $userInfo->trust_rank : 0;
+        
         if (!$trustRank) {
             $trustRank = $this->trustGraph->calculateTrustRank($endorserUserId);
-            update_user_meta($endorserUserId, 'bcc_trust_graph_rank', $trustRank);
+            $this->userInfoRepo->updateTrustRank($endorserUserId, $trustRank);
         }
 
         $rings = $this->trustGraph->detectVoteRings(3);
@@ -162,7 +171,8 @@ class EndorsementService {
 
         return TransactionManager::run(function () use (
             $endorserUserId, $pageId, $context, $reason, $page, $pageOwnerId,
-            $adjustedWeight, $automationData, $fingerprint, $fraudAnalysis
+            $adjustedWeight, $automationData, $fingerprint, $fraudAnalysis,
+            $baseWeight
         ) {
             // Create endorsement
             $endorsementId = $this->endorseRepo->create(
@@ -173,15 +183,13 @@ class EndorsementService {
                 $reason
             );
 
-            // ======================================================
-            // UPDATED: Apply endorsement bonus using PageScore
-            // ======================================================
+            // Apply endorsement bonus using PageScore
             $this->applyEndorsementBonus($pageId, $adjustedWeight);
 
-            // Update endorser's stats
+            // Update endorser's stats in user_info table
             $this->updateEndorserStats($endorserUserId);
 
-            // Update fraud score
+            // Update fraud score in user_info table
             $this->updateFraudScore($endorserUserId, $fraudAnalysis, $automationData);
 
             // Log the endorsement
@@ -197,9 +205,7 @@ class EndorsementService {
             // Get updated endorsement count
             $endorsementCount = $this->getPageEndorsementCount($pageId);
 
-            // ======================================================
-            // UPDATED: Get updated page score as PageScore
-            // ======================================================
+            // Get updated page score as PageScore
             $updatedScore = $this->scoreRepo->getByPageId($pageId);
 
             return [
@@ -224,9 +230,7 @@ class EndorsementService {
     }
 
     /**
-     * ======================================================
-     * UPDATED: Apply endorsement bonus using PageScore
-     * ======================================================
+     * Apply endorsement bonus using PageScore
      */
     private function applyEndorsementBonus(int $pageId, float $weight): void {
         $score = $this->scoreRepo->getByPageId($pageId);
@@ -245,9 +249,7 @@ class EndorsementService {
     }
 
     /**
-     * ======================================================
-     * UPDATED: Remove endorsement bonus using PageScore
-     * ======================================================
+     * Remove endorsement bonus using PageScore
      */
     private function removeEndorsementBonus(int $pageId, float $weight): void {
         $score = $this->scoreRepo->getByPageId($pageId);
@@ -289,10 +291,11 @@ class EndorsementService {
             // Delete endorsement (soft delete)
             $this->endorseRepo->delete($endorserUserId, $pageId, $context);
 
-            // ======================================================
-            // UPDATED: Remove endorsement bonus using PageScore
-            // ======================================================
+            // Remove endorsement bonus using PageScore
             $this->removeEndorsementBonus($pageId, $weight);
+
+            // Update endorser's stats in user_info table
+            $this->updateEndorserStats($endorserUserId);
 
             // Log the revocation
             AuditLogger::revokeEndorsement($pageId, $context, [
@@ -303,9 +306,7 @@ class EndorsementService {
             // Get updated endorsement count
             $endorsementCount = $this->getPageEndorsementCount($pageId);
 
-            // ======================================================
-            // UPDATED: Get updated page score as PageScore
-            // ======================================================
+            // Get updated page score as PageScore
             $updatedScore = $this->scoreRepo->getByPageId($pageId);
 
             return [
@@ -320,7 +321,7 @@ class EndorsementService {
     }
 
     /**
-     * Calculate base endorsement weight
+     * Calculate base endorsement weight using user_info table
      */
     private function calculateBaseEndorserWeight(int $userId): float {
         $weight = 1.0;
@@ -335,15 +336,15 @@ class EndorsementService {
             }
             $avgScore = $totalScore / count($userPages);
             
-            // Apply tier-based weight
+            // Apply tier-based weight (with defaults if constants not defined)
             if ($avgScore >= 80) {
-                $weight = BCC_TRUST_ENDORSE_ELITE;
+                $weight = defined('BCC_TRUST_ENDORSE_ELITE') ? BCC_TRUST_ENDORSE_ELITE : 2.0;
             } elseif ($avgScore >= 65) {
-                $weight = BCC_TRUST_ENDORSE_TRUSTED;
+                $weight = defined('BCC_TRUST_ENDORSE_TRUSTED') ? BCC_TRUST_ENDORSE_TRUSTED : 1.5;
             } elseif ($avgScore <= 35) {
-                $weight = BCC_TRUST_ENDORSE_RISKY;
+                $weight = defined('BCC_TRUST_ENDORSE_RISKY') ? BCC_TRUST_ENDORSE_RISKY : 0.3;
             } elseif ($avgScore <= 45) {
-                $weight = BCC_TRUST_ENDORSE_CAUTION;
+                $weight = defined('BCC_TRUST_ENDORSE_CAUTION') ? BCC_TRUST_ENDORSE_CAUTION : 0.6;
             }
             
             // Page count multiplier
@@ -355,9 +356,8 @@ class EndorsementService {
             }
         }
 
-        // Check if user is verified
-        $verificationRepo = new \BCCTrust\Repositories\VerificationRepository();
-        if ($verificationRepo->isVerified($userId)) {
+        // Check if user is verified using verification repo
+        if ($this->verificationRepo->isVerified($userId)) {
             $weight *= 1.2;
         }
 
@@ -390,7 +390,6 @@ class EndorsementService {
         int $userId
     ): float {
         $weight = $baseWeight;
-        $adjustments = [];
 
         // Fraud score adjustment
         if ($fraudAnalysis['score'] > 50) {
@@ -437,7 +436,6 @@ class EndorsementService {
 
         // Apply diminishing returns for very high weights
         if ($weight > 2.0) {
-            $originalWeight = $weight;
             $weight = 2.0 + (($weight - 2.0) * 0.3);
         }
 
@@ -448,7 +446,7 @@ class EndorsementService {
     }
 
     /**
-     * Update fraud score based on endorsement activity
+     * Update fraud score in user_info table based on endorsement activity
      */
     private function updateFraudScore(int $userId, array $fraudAnalysis, array $automationData): void {
         $currentFraud = $fraudAnalysis['score'];
@@ -464,7 +462,9 @@ class EndorsementService {
 
         if ($increase > 0) {
             $newFraud = min(100, $currentFraud + $increase);
-            update_user_meta($userId, 'bcc_trust_fraud_score', $newFraud);
+            
+            // Update user_info table
+            $this->userInfoRepo->updateFraudScore($userId, $newFraud);
             
             AuditLogger::log('fraud_score_increased', $userId, [
                 'old_score' => $currentFraud,
@@ -503,7 +503,7 @@ class EndorsementService {
     }
 
     /**
-     * Get endorsements given by user
+     * Get endorsements given by user with fraud data from user_info
      */
     public function getUserEndorsements(?int $endorserUserId = null, int $limit = 20): array {
         $endorserUserId = $endorserUserId ?? get_current_user_id();
@@ -514,20 +514,25 @@ class EndorsementService {
 
         $endorsements = $this->endorseRepo->getByEndorser($endorserUserId, $limit);
         
+        // Get user info for fraud score
+        $userInfo = $this->userInfoRepo->getByUserId($endorserUserId);
+        $fraudScore = $userInfo ? $userInfo->fraud_score : 0;
+        
         foreach ($endorsements as &$endorsement) {
-            $endorsement->endorser_fraud_score = (int) get_user_meta($endorserUserId, 'bcc_trust_fraud_score', true);
+            $endorsement->endorser_fraud_score = $fraudScore;
         }
         
         return $endorsements;
     }
 
     /**
-     * Update endorser's stats
+     * Update endorser's stats in user_info table
      */
     private function updateEndorserStats(int $userId): void {
         $endorsementCount = $this->endorseRepo->countByEndorser($userId);
-        update_user_meta($userId, 'bcc_trust_endorsements_given', $endorsementCount);
-        update_user_meta($userId, 'bcc_trust_last_active', time());
+        
+        // Update user_info table
+        $this->userInfoRepo->updateEndorsementsGiven($userId, $endorsementCount);
     }
 
     /**
@@ -597,7 +602,7 @@ class EndorsementService {
     private function getAverageEndorsementWeight(int $userId): float {
         global $wpdb;
         
-        $table = $wpdb->prefix . 'bcc_trust_endorsements';
+        $table = bcc_trust_endorsements_table();
         
         $avg = $wpdb->get_var($wpdb->prepare(
             "SELECT AVG(weight) FROM {$table}

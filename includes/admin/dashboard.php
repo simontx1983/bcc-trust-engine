@@ -3,259 +3,6 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-if (!function_exists('bcc_trust_votes_table')) {
-    function bcc_trust_votes_table() {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_trust_votes';
-    }
-}
-
-if (!function_exists('bcc_trust_scores_table')) {
-    function bcc_trust_scores_table() {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_trust_page_scores';
-    }
-}
-
-if (!function_exists('bcc_trust_endorsements_table')) {
-    function bcc_trust_endorsements_table() {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_trust_endorsements';
-    }
-}
-
-if (!function_exists('bcc_trust_activity_table')) {
-    function bcc_trust_activity_table() {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_trust_activity';
-    }
-}
-
-if (!function_exists('bcc_trust_fingerprints_table')) {
-    function bcc_trust_fingerprints_table() {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_trust_device_fingerprints';
-    }
-}
-
-if (!function_exists('bcc_trust_patterns_table')) {
-    function bcc_trust_patterns_table() {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_trust_patterns';
-    }
-}
-
-if (!function_exists('bcc_trust_user_info_table')) {
-    function bcc_trust_user_info_table() {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_trust_user_info';
-    }
-}
-
-if (!function_exists('bcc_trust_flags_table')) {
-    function bcc_trust_flags_table() {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_trust_flags';
-    }
-}
-
-if (!function_exists('bcc_trust_reputation_table')) {
-    function bcc_trust_reputation_table() {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_trust_reputation';
-    }
-}
-
-if (!function_exists('bcc_trust_eligibility_table')) {
-    function bcc_trust_eligibility_table() {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_trust_eligibility';
-    }
-}
-
-if (!function_exists('bcc_trust_verifications_table')) {
-    function bcc_trust_verifications_table() {
-        global $wpdb;
-        return $wpdb->prefix . 'bcc_trust_verifications';
-    }
-}
-
-if (!function_exists('bcc_trust_get_page_owner')) {
-    function bcc_trust_get_page_owner($page_id) {
-        global $wpdb;
-        
-        
-        $possible_tables = [
-            $wpdb->prefix . 'peepso_page_users',
-            $wpdb->prefix . 'peepso_pages_users', 
-            $wpdb->prefix . 'peepso_page_members'
-        ];
-        
-        foreach ($possible_tables as $table) {
-            if ($wpdb->get_var("SHOW TABLES LIKE '$table'") == $table) {
-                $owner = $wpdb->get_var($wpdb->prepare(
-                    "SELECT user_id FROM {$table} 
-                     WHERE page_id = %d AND (role = 'owner' OR role = 'admin' OR is_owner = 1) 
-                     LIMIT 1",
-                    $page_id
-                ));
-                
-                if ($owner) {
-                    return $owner;
-                }
-            }
-        }
-        
-        // Fallback to post author
-        $post = get_post($page_id);
-        return $post ? $post->post_author : 0;
-    }
-}
-
-/**
- * Log audit event helper
- */
-if (!function_exists('bcc_trust_log_audit')) {
-    function bcc_trust_log_audit($action, $data = []) {
-        if (class_exists('\\BCCTrust\\Security\\AuditLogger')) {
-            \BCCTrust\Security\AuditLogger::log($action, null, $data);
-        }
-    }
-}
-
-if (!function_exists('bcc_trust_add_repair_button')) {
-    function bcc_trust_add_repair_button() {
-        global $wpdb;
-        
-        $scoresTable = bcc_trust_scores_table();
-        $postsTable = $wpdb->posts;
-        
-        $mismatches = $wpdb->get_var("
-            SELECT COUNT(*) 
-            FROM {$scoresTable} s
-            LEFT JOIN {$postsTable} p ON s.page_id = p.ID
-            WHERE s.page_owner_id != p.post_author OR p.ID IS NULL
-        ");
-        
-        if ($mismatches > 0) {
-            ?>
-            <div class="notice notice-warning" style="margin: 20px 0 10px;">
-                <p>
-                    <strong>⚠️ Page-Owner Mismatch Detected:</strong> 
-                    <?php echo $mismatches; ?> page(s) have incorrect owner assignments.
-                    <a href="<?php echo admin_url('admin.php?page=bcc-trust-dashboard&tab=repair&action=repair_owners'); ?>" 
-                       class="button button-small" 
-                       onclick="return confirm('Run page-owner repair? This will fix mismatched page owners.');">
-                        🔧 Repair Now
-                    </a>
-                </p>
-            </div>
-            <?php
-        }
-    }
-}
-
-
-
-if (!function_exists('bcc_trust_sync_user_info')) {
-    function bcc_trust_sync_user_info($user_id = null) {
-        global $wpdb;
-        
-        $table_name = bcc_trust_user_info_table();
-        
-        if ($user_id) {
-            $users = [get_userdata($user_id)];
-        } else {
-            $users = get_users(['number' => -1]);
-        }
-        
-        $synced_count = 0;
-        
-        foreach ($users as $user) {
-            if (!$user) continue;
-            
-            // Get PeepSo user data
-            $peepso_user = $wpdb->get_row($wpdb->prepare("
-                SELECT * FROM {$wpdb->prefix}peepso_users 
-                WHERE usr_id = %d
-            ", $user->ID));
-            
-            // Get pages owned
-            $pages_owned = $wpdb->get_results($wpdb->prepare("
-                SELECT pm_page_id 
-                FROM {$wpdb->prefix}peepso_page_members 
-                WHERE pm_user_id = %d 
-                AND pm_user_status = 'member_owner'
-            ", $user->ID));
-            
-            $page_ids_owned = wp_list_pluck($pages_owned, 'pm_page_id');
-            $pages_owned_count = count($page_ids_owned);
-            
-            // Get trust/fraud data
-            $trust_data = get_user_meta($user->ID, 'bcc_trust_fraud_analysis', true);
-            $fraud_score = (int) get_user_meta($user->ID, 'bcc_trust_fraud_score', true);
-            $trust_rank = (float) get_user_meta($user->ID, 'bcc_trust_graph_rank', true);
-            $votes_cast = (int) get_user_meta($user->ID, 'bcc_trust_votes_cast', true);
-            $endorsements_given = (int) get_user_meta($user->ID, 'bcc_trust_endorsements_given', true);
-            $fraud_triggers = get_user_meta($user->ID, 'bcc_trust_fraud_triggers', true);
-            
-            // Prepare data for insert/update
-            $data = [
-                'user_id' => $user->ID,
-                'user_login' => $user->user_login,
-                'user_email' => $user->user_email,
-                'display_name' => $user->display_name ?: $user->user_login,
-                'registered' => $user->user_registered,
-                
-                // PeepSo data
-                'usr_id' => $peepso_user ? $peepso_user->usr_id : null,
-                'usr_last_activity' => $peepso_user ? $peepso_user->usr_last_activity : null,
-                
-                // Trust scores
-                'fraud_score' => $fraud_score,
-                'trust_rank' => $trust_rank,
-                'risk_level' => is_array($trust_data) ? ($trust_data['risk_level'] ?? 'unknown') : 'unknown',
-                'is_suspended' => (int) get_user_meta($user->ID, 'bcc_trust_suspended', true),
-                'is_verified' => (int) get_user_meta($user->ID, 'bcc_trust_email_verified', true),
-                'votes_cast' => $votes_cast,
-                'endorsements_given' => $endorsements_given,
-                
-                // Page stats
-                'pages_owned' => $pages_owned_count,
-                'page_ids_owned' => !empty($page_ids_owned) ? json_encode($page_ids_owned) : null,
-                
-                // Fraud data
-                'fraud_triggers' => is_array($fraud_triggers) ? json_encode($fraud_triggers) : null,
-                
-                'metadata' => json_encode([
-                    'roles' => implode(', ', $user->roles)
-                ])
-            ];
-            
-            // Check if record exists
-            $exists = $wpdb->get_var($wpdb->prepare(
-                "SELECT id FROM $table_name WHERE user_id = %d",
-                $user->ID
-            ));
-            
-            if ($exists) {
-                $wpdb->update($table_name, $data, ['user_id' => $user->ID]);
-            } else {
-                $wpdb->insert($table_name, $data);
-            }
-            
-            $synced_count++;
-        }
-        
-        return $synced_count;
-    }
-}
-
-
-// ======================================================
-// ADMIN MENU AND DASHBOARD FUNCTIONS
-// ======================================================
-
 add_action('admin_menu', function () {
     add_menu_page(
         'Trust Engine Dashboard',
@@ -266,8 +13,12 @@ add_action('admin_menu', function () {
         'dashicons-shield',
         26
     );
+
 });
 
+/**
+ * Main dashboard render function
+ */
 function bcc_trust_render_dashboard() {
     if (!current_user_can('manage_options')) {
         return;
@@ -333,6 +84,42 @@ function bcc_trust_render_dashboard() {
     <?php
 }
 
+/**
+ * Add repair notification to overview
+ */
+function bcc_trust_add_repair_button() {
+    global $wpdb;
+    
+    $scoresTable = bcc_trust_scores_table();
+    $postsTable = $wpdb->posts;
+    
+    $mismatches = $wpdb->get_var("
+        SELECT COUNT(*) 
+        FROM {$scoresTable} s
+        LEFT JOIN {$wpdb->posts} p ON s.page_id = p.ID
+        WHERE s.page_owner_id != p.post_author OR p.ID IS NULL
+    ");
+    
+    if ($mismatches > 0) {
+        ?>
+        <div class="notice notice-warning" style="margin: 20px 0 10px;">
+            <p>
+                <strong>⚠️ Page-Owner Mismatch Detected:</strong> 
+                <?php echo $mismatches; ?> page(s) have incorrect owner assignments.
+                <a href="<?php echo admin_url('admin.php?page=bcc-trust-dashboard&tab=repair&action=repair_owners'); ?>" 
+                   class="button button-small" 
+                   onclick="return confirm('Run page-owner repair? This will fix mismatched page owners.');">
+                    🔧 Repair Now
+                </a>
+            </p>
+        </div>
+        <?php
+    }
+}
+
+/**
+ * Overview Tab
+ */
 function bcc_trust_render_overview_tab() {
     global $wpdb;
 
@@ -345,6 +132,8 @@ function bcc_trust_render_overview_tab() {
     $fingerprintTable = bcc_trust_fingerprints_table();
     $patternsTable = bcc_trust_patterns_table();
     $userInfoTable = bcc_trust_user_info_table();
+    $fraudAnalysisTable = bcc_trust_fraud_analysis_table();
+    $suspensionsTable = bcc_trust_suspensions_table();
 
     // System stats
     $totalVotes = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$votesTable} WHERE status = 1");
@@ -375,6 +164,19 @@ function bcc_trust_render_overview_tab() {
         SELECT risk_level, COUNT(*) as count
         FROM {$userInfoTable}
         GROUP BY risk_level
+    ");
+
+    // Fraud analysis stats
+    $totalFraudAnalyses = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$fraudAnalysisTable}");
+    $criticalAnalyses = (int) $wpdb->get_var("
+        SELECT COUNT(*) FROM {$fraudAnalysisTable}
+        WHERE risk_level = 'critical'
+    ");
+
+    // Suspension stats
+    $activeSuspensions = (int) $wpdb->get_var("
+        SELECT COUNT(*) FROM {$suspensionsTable}
+        WHERE unsuspended_at IS NULL
     ");
 
     // Fraud stats from fingerprints
@@ -409,9 +211,9 @@ function bcc_trust_render_overview_tab() {
         WHERE status = 1
     ");
 
-    // Recent activity
+    // Recent activity (without metadata)
     $recentActivity = $wpdb->get_results("
-        SELECT action, user_id, target_id, target_type, created_at, metadata
+        SELECT action, user_id, target_id, target_type, created_at
         FROM {$auditTable}
         ORDER BY created_at DESC
         LIMIT 10
@@ -478,6 +280,16 @@ function bcc_trust_render_overview_tab() {
             </div>
         </div>
 
+        <!-- Fraud Analysis -->
+        <div class="stat-card" style="background: #fff; padding: 20px; border: 1px solid #ccd0d4; box-shadow: 0 1px 1px rgba(0,0,0,.04);">
+            <h3>Fraud Analysis</h3>
+            <div class="stat-value" style="font-size: 32px; font-weight: bold;"><?php echo number_format($totalFraudAnalyses); ?></div>
+            <div class="stat-detail">
+                🔴 <?php echo number_format($criticalAnalyses); ?> critical<br>
+                ⚪ <?php echo number_format($activeSuspensions); ?> active suspensions
+            </div>
+        </div>
+
         <!-- Behavioral Patterns -->
         <div class="stat-card" style="background: #fff; padding: 20px; border: 1px solid #ccd0d4; box-shadow: 0 1px 1px rgba(0,0,0,.04);">
             <h3>Behavioral Analysis</h3>
@@ -538,7 +350,6 @@ function bcc_trust_render_overview_tab() {
                 <th>Target</th>
                 <th>Type</th>
                 <th>Time</th>
-                <th>Metadata</th>
             </tr>
         </thead>
         <tbody>
@@ -574,13 +385,6 @@ function bcc_trust_render_overview_tab() {
                     </td>
                     <td><?php echo esc_html($row->target_type ?: '—'); ?></td>
                     <td><?php echo esc_html($row->created_at); ?></td>
-                    <td>
-                        <?php if ($row->metadata): ?>
-                            <pre style="margin:0; font-size:10px; max-height:60px; overflow:auto;"><?php echo esc_html(substr($row->metadata, 0, 100)); ?>...</pre>
-                        <?php else: ?>
-                            —
-                        <?php endif; ?>
-                    </td>
                 </tr>
             <?php endforeach; ?>
         </tbody>
@@ -725,7 +529,377 @@ function bcc_trust_render_pages_tab() {
 }
 
 /**
- * Users Tab - User Trust Scores (UPDATED to use user_info table)
+ * All Pages Tab - Shows EVERY page with trust scores
+ */
+function bcc_trust_render_all_pages_tab() {
+    global $wpdb;
+    
+    // Get current page for pagination
+    $current_page = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
+    $per_page = 20;
+    $offset = ($current_page - 1) * $per_page;
+    
+    // Get filter/sort parameters
+    $search = isset($_GET['s']) ? sanitize_text_field($_GET['s']) : '';
+    $tier_filter = isset($_GET['tier']) ? sanitize_key($_GET['tier']) : '';
+    $status_filter = isset($_GET['status']) ? sanitize_key($_GET['status']) : '';
+    $orderby = isset($_GET['orderby']) ? sanitize_key($_GET['orderby']) : 'total_score';
+    $order = isset($_GET['order']) && strtoupper($_GET['order']) === 'ASC' ? 'ASC' : 'DESC';
+    
+    // Build WHERE clause
+    $where = "1=1";
+    $params = [];
+    
+    if ($search) {
+        $where .= " AND (p.post_title LIKE %s OR p.ID LIKE %s)";
+        $params[] = '%' . $wpdb->esc_like($search) . '%';
+        $params[] = '%' . $wpdb->esc_like($search) . '%';
+    }
+    
+    if ($tier_filter) {
+        $where .= " AND s.reputation_tier = %s";
+        $params[] = $tier_filter;
+    }
+    
+    if ($status_filter === 'with_scores') {
+        $where .= " AND s.id IS NOT NULL";
+    } elseif ($status_filter === 'without_scores') {
+        $where .= " AND s.id IS NULL";
+    } elseif ($status_filter === 'published') {
+        $where .= " AND p.post_status = 'publish'";
+    } elseif ($status_filter === 'draft') {
+        $where .= " AND p.post_status = 'draft'";
+    } elseif ($status_filter === 'private') {
+        $where .= " AND p.post_status = 'private'";
+    } elseif ($status_filter === 'trash') {
+        $where .= " AND p.post_status = 'trash'";
+    }
+    
+    // Get ALL PeepSo pages with their trust scores (if any)
+    $sql = "SELECT 
+                p.ID as page_id,
+                p.post_title as page_title,
+                p.post_author as page_owner_id,
+                p.post_status as page_status,
+                p.post_date as page_created,
+                s.*,
+                u.display_name as owner_name,
+                u.user_email as owner_email,
+                u.user_login as owner_login
+            FROM {$wpdb->posts} p
+            LEFT JOIN " . bcc_trust_scores_table() . " s ON p.ID = s.page_id
+            LEFT JOIN {$wpdb->users} u ON p.post_author = u.ID
+            WHERE p.post_type = 'peepso-page'
+            AND {$where}
+            ORDER BY ";
+    
+    // Validate orderby to prevent SQL injection
+    $valid_orderby = ['total_score', 'vote_count', 'confidence_score', 'page_id', 'post_title', 'post_date'];
+    if (in_array($orderby, $valid_orderby)) {
+        if ($orderby === 'post_title' || $orderby === 'post_date') {
+            $sql .= "p.{$orderby} {$order}";
+        } elseif ($orderby === 'page_id') {
+            $sql .= "p.ID {$order}";
+        } else {
+            $sql .= "COALESCE(s.{$orderby}, 0) {$order}";
+        }
+    } else {
+        $sql .= "COALESCE(s.total_score, 0) DESC, p.ID DESC";
+    }
+    
+    // Get total count for pagination
+    $count_sql = "SELECT COUNT(*) FROM {$wpdb->posts} p 
+                  WHERE p.post_type = 'peepso-page' AND {$where}";
+    if (!empty($params)) {
+        $count_sql = $wpdb->prepare($count_sql, $params);
+    }
+    $total_items = $wpdb->get_var($count_sql);
+    
+    // Add limit for current page
+    $sql .= " LIMIT %d OFFSET %d";
+    $params[] = $per_page;
+    $params[] = $offset;
+    
+    if (!empty($params)) {
+        $sql = $wpdb->prepare($sql, $params);
+    }
+    
+    $pages = $wpdb->get_results($sql);
+    
+    // Get tier counts for filter dropdown
+    $tier_counts = $wpdb->get_results("
+        SELECT reputation_tier, COUNT(*) as count 
+        FROM " . bcc_trust_scores_table() . " 
+        GROUP BY reputation_tier
+    ");
+    $tier_counts_assoc = [];
+    foreach ($tier_counts as $tc) {
+        $tier_counts_assoc[$tc->reputation_tier] = $tc->count;
+    }
+    
+    // Get status counts
+    $status_counts = $wpdb->get_results("
+        SELECT post_status, COUNT(*) as count 
+        FROM {$wpdb->posts} 
+        WHERE post_type = 'peepso-page'
+        GROUP BY post_status
+    ");
+    $status_counts_assoc = [];
+    foreach ($status_counts as $sc) {
+        $status_counts_assoc[$sc->post_status] = $sc->count;
+    }
+    
+    $scores_count = $wpdb->get_var("SELECT COUNT(*) FROM " . bcc_trust_scores_table());
+   ?>
+    
+    <div class="wrap">
+        <h2>All PeepSo Pages</h2>
+        
+        <!-- Filter Bar -->
+        <div class="tablenav top">
+            <form method="get" style="display: inline-block; width: 100%;">
+                <input type="hidden" name="page" value="bcc-trust-dashboard">
+                <input type="hidden" name="tab" value="all-pages">
+                
+                <div class="alignleft actions">
+                    <select name="tier">
+                        <option value="">All Tiers</option>
+                        <option value="elite" <?php selected($tier_filter, 'elite'); ?>>Elite (<?php echo $tier_counts_assoc['elite'] ?? 0; ?>)</option>
+                        <option value="trusted" <?php selected($tier_filter, 'trusted'); ?>>Trusted (<?php echo $tier_counts_assoc['trusted'] ?? 0; ?>)</option>
+                        <option value="neutral" <?php selected($tier_filter, 'neutral'); ?>>Neutral (<?php echo $tier_counts_assoc['neutral'] ?? 0; ?>)</option>
+                        <option value="caution" <?php selected($tier_filter, 'caution'); ?>>Caution (<?php echo $tier_counts_assoc['caution'] ?? 0; ?>)</option>
+                        <option value="risky" <?php selected($tier_filter, 'risky'); ?>>Risky (<?php echo $tier_counts_assoc['risky'] ?? 0; ?>)</option>
+                    </select>
+                    
+                    <select name="status">
+                        <option value="">All Statuses</option>
+                        <option value="published" <?php selected($status_filter, 'published'); ?>>Published (<?php echo $status_counts_assoc['publish'] ?? 0; ?>)</option>
+                        <option value="private" <?php selected($status_filter, 'private'); ?>>Private (<?php echo $status_counts_assoc['private'] ?? 0; ?>)</option>
+                        <option value="draft" <?php selected($status_filter, 'draft'); ?>>Draft (<?php echo $status_counts_assoc['draft'] ?? 0; ?>)</option>
+                        <option value="trash" <?php selected($status_filter, 'trash'); ?>>Trash (<?php echo $status_counts_assoc['trash'] ?? 0; ?>)</option>
+                        <option value="with_scores" <?php selected($status_filter, 'with_scores'); ?>>With Trust Scores (<?php echo $scores_count; ?>)</option>
+                        <option value="without_scores" <?php selected($status_filter, 'without_scores'); ?>>Without Scores (<?php echo $total_items - $scores_count; ?>)</option>
+                    </select>
+                    
+                    <select name="orderby">
+                        <option value="total_score" <?php selected($orderby, 'total_score'); ?>>Sort by Trust Score</option>
+                        <option value="vote_count" <?php selected($orderby, 'vote_count'); ?>>Sort by Vote Count</option>
+                        <option value="confidence_score" <?php selected($orderby, 'confidence_score'); ?>>Sort by Confidence</option>
+                        <option value="post_date" <?php selected($orderby, 'post_date'); ?>>Sort by Creation Date</option>
+                        <option value="post_title" <?php selected($orderby, 'post_title'); ?>>Sort by Title</option>
+                        <option value="page_id" <?php selected($orderby, 'page_id'); ?>>Sort by Page ID</option>
+                    </select>
+                    
+                    <select name="order">
+                        <option value="DESC" <?php selected($order, 'DESC'); ?>>Descending</option>
+                        <option value="ASC" <?php selected($order, 'ASC'); ?>>Ascending</option>
+                    </select>
+                    
+                    <input type="submit" class="button" value="Apply Filters">
+                </div>
+                
+                <div class="alignright">
+                    <input type="search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="Search pages...">
+                    <input type="submit" class="button" value="Search">
+                </div>
+            </form>
+        </div>
+        
+        <!-- Pages Table -->
+        <table class="wp-list-table widefat fixed striped">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Page</th>
+                    <th>Owner</th>
+                    <th>Status</th>
+                    <th>Trust Score</th>
+                    <th>Tier</th>
+                    <th>Votes</th>
+                    <th>Endorsements</th>
+                    <th>Confidence</th>
+                    <th>Created</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if (empty($pages)): ?>
+                    <tr>
+                        <td colspan="11" style="text-align:center; padding:20px;">
+                            <strong>No pages found matching your criteria.</strong>
+                        </td>
+                    </tr>
+                <?php else: ?>
+                    <?php foreach ($pages as $page): 
+                        $has_score = !empty($page->total_score);
+                        $tier_info = $has_score ? bcc_trust_get_tier_info($page->reputation_tier) : ['color' => '#999', 'icon' => '❓'];
+                        
+                        // Determine status color
+                        $status_color = '#999';
+                        $status_label = $page->page_status;
+                        switch ($page->page_status) {
+                            case 'publish':
+                                $status_color = '#4caf50';
+                                $status_label = 'Published';
+                                break;
+                            case 'private':
+                                $status_color = '#ff9800';
+                                $status_label = 'Private';
+                                break;
+                            case 'draft':
+                                $status_color = '#f44336';
+                                $status_label = 'Draft';
+                                break;
+                            case 'trash':
+                                $status_color = '#9e9e9e';
+                                $status_label = 'Trash';
+                                break;
+                            default:
+                                $status_color = '#999';
+                                $status_label = ucfirst($page->page_status);
+                        }
+                        
+                        // Handle owner information - post_author = 0 is common for system pages
+                        $has_owner = !empty($page->page_owner_id) && $page->page_owner_id > 0;
+                        $owner_display = 'System';
+                        $owner_link = '#';
+                        
+                        if ($has_owner) {
+                            if (!empty($page->owner_name)) {
+                                $owner_display = $page->owner_name;
+                            } elseif (!empty($page->owner_login)) {
+                                $owner_display = $page->owner_login;
+                            } else {
+                                // Try to get user directly
+                                $user = get_userdata($page->page_owner_id);
+                                if ($user) {
+                                    $owner_display = $user->display_name ?: $user->user_login;
+                                } else {
+                                    $owner_display = 'User #' . $page->page_owner_id . ' (deleted)';
+                                }
+                            }
+                            $owner_link = admin_url('admin.php?page=bcc-trust-moderation&user_id=' . $page->page_owner_id);
+                        }
+                    ?>
+                        <tr>
+                            <td><strong>#<?php echo $page->page_id; ?></strong></td>
+                            <td>
+                                <strong><?php echo esc_html($page->page_title ?: 'Untitled'); ?></strong>
+                                <?php if (empty($page->page_title)): ?>
+                                    <br><small style="color: #999;">(no title)</small>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php if ($has_owner): ?>
+                                    <a href="<?php echo esc_url($owner_link); ?>" title="User ID: <?php echo $page->page_owner_id; ?>">
+                                        <?php echo esc_html($owner_display); ?>
+                                    </a>
+                                <?php else: ?>
+                                    <span style="color: #999;"><?php echo $owner_display; ?></span>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <span style="background: <?php echo $status_color; ?>; color: #fff; padding: 3px 8px; border-radius: 3px; display: inline-block; font-size: 11px;">
+                                    <?php echo esc_html($status_label); ?>
+                                </span>
+                            </td>
+                            <td>
+                                <?php if ($has_score): ?>
+                                    <strong><?php echo number_format($page->total_score, 1); ?></strong>
+                                <?php else: ?>
+                                    <em style="color: #999;">No score yet</em>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php if ($has_score): ?>
+                                    <span style="padding: 3px 8px; border-radius: 3px; background: <?php echo $tier_info['color']; ?>; color: #fff; display: inline-block; font-size: 11px;">
+                                        <?php echo $tier_info['icon']; ?> <?php echo esc_html(ucfirst($page->reputation_tier)); ?>
+                                    </span>
+                                <?php else: ?>
+                                    <span style="color: #999;">—</span>
+                                <?php endif; ?>
+                            </td>
+                            <td><?php echo $has_score ? number_format($page->vote_count) : '0'; ?></td>
+                            <td><?php echo $has_score ? number_format($page->endorsement_count) : '0'; ?></td>
+                            <td>
+                                <?php if ($has_score && $page->confidence_score > 0): ?>
+                                    <div style="display:flex; align-items:center;">
+                                        <div style="width:50px; height:6px; background:#eee; border-radius:3px; margin-right:8px;">
+                                            <div style="width:<?php echo $page->confidence_score * 100; ?>%; height:6px; background:#2196f3; border-radius:3px;"></div>
+                                        </div>
+                                        <?php echo round($page->confidence_score * 100); ?>%
+                                    </div>
+                                <?php else: ?>
+                                    —
+                                <?php endif; ?>
+                            </td>
+                            <td><?php echo date('Y-m-d', strtotime($page->page_created)); ?></td>
+                            <td>
+                                <a href="<?php echo get_permalink($page->page_id); ?>" class="button button-small" target="_blank">View</a>
+                                <?php if ($has_owner): ?>
+                                    <a href="<?php echo esc_url($owner_link); ?>" class="button button-small">Owner</a>
+                                <?php endif; ?>
+                                <?php if (!$has_score): ?>
+                                    <button class="button button-small" onclick="initializePageScore(<?php echo $page->page_id; ?>)">Init</button>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+            </tbody>
+        </table>
+        
+        <!-- Pagination -->
+        <?php
+        $total_pages = ceil($total_items / $per_page);
+        if ($total_pages > 1):
+        ?>
+        <div class="tablenav bottom">
+            <div class="tablenav-pages">
+                <span class="displaying-num"><?php echo number_format($total_items); ?> items</span>
+                <?php
+                echo paginate_links([
+                    'base' => add_query_arg('paged', '%#%'),
+                    'format' => '',
+                    'prev_text' => '&laquo;',
+                    'next_text' => '&raquo;',
+                    'total' => $total_pages,
+                    'current' => $current_page
+                ]);
+                ?>
+            </div>
+        </div>
+        <?php endif; ?>
+    </div>
+    
+    <script>
+    function initializePageScore(pageId) {
+        if (confirm('Initialize trust score for this page? This will create a default score of 50.')) {
+            jQuery.ajax({
+                url: ajaxurl,
+                type: 'POST',
+                data: {
+                    action: 'bcc_trust_init_page_score',
+                    page_id: pageId,
+                    nonce: '<?php echo wp_create_nonce('bcc_trust_admin'); ?>'
+                },
+                success: function(response) {
+                    if (response.success) {
+                        alert('Score initialized successfully!');
+                        location.reload();
+                    } else {
+                        alert('Error: ' + response.data);
+                    }
+                }
+            });
+        }
+    }
+    </script>
+    <?php
+}
+
+/**
+ * Users Tab - User Trust Scores
  */
 function bcc_trust_render_users_tab() {
     global $wpdb;
@@ -1025,7 +1199,6 @@ function bcc_trust_render_activity_tab() {
                 <th>User</th>
                 <th>Target</th>
                 <th>IP Address</th>
-                <th>Metadata</th>
             </tr>
         </thead>
         <tbody>
@@ -1072,14 +1245,6 @@ function bcc_trust_render_activity_tab() {
                             —
                         <?php endif; ?>
                     </td>
-                    <td>
-                        <?php if ($row->metadata): ?>
-                            <?php $metadata = json_decode($row->metadata, true); ?>
-                            <pre style="margin:0; font-size:10px; max-height:60px; overflow:auto;"><?php echo esc_html(json_encode($metadata, JSON_PRETTY_PRINT)); ?></pre>
-                        <?php else: ?>
-                            —
-                        <?php endif; ?>
-                    </td>
                 </tr>
             <?php endforeach; ?>
         </tbody>
@@ -1107,15 +1272,15 @@ function bcc_trust_render_activity_tab() {
 }
 
 /**
- * Fraud Tab - Fraud Detection Dashboard (UPDATED to use user_info table)
+ * Fraud Tab - Fraud Detection Dashboard
  */
 function bcc_trust_render_fraud_tab() {
     global $wpdb;
 
     $auditTable = bcc_trust_activity_table();
-    $votesTable = bcc_trust_votes_table();
-    $fingerprintTable = bcc_trust_fingerprints_table();
     $userInfoTable = bcc_trust_user_info_table();
+    $fraudAnalysisTable = bcc_trust_fraud_analysis_table();
+    $suspensionsTable = bcc_trust_suspensions_table();
 
     // Get fraud statistics from user_info table
     $fraudStats = [];
@@ -1135,10 +1300,24 @@ function bcc_trust_render_fraud_tab() {
         $fraudStats['risk_distribution'][$rd->risk_level] = $rd->count;
     }
 
+    // Fraud analysis stats
+    $fraudStats['total_analyses'] = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$fraudAnalysisTable}");
+    $fraudStats['critical_analyses'] = (int) $wpdb->get_var("
+        SELECT COUNT(*) FROM {$fraudAnalysisTable}
+        WHERE risk_level = 'critical'
+    ");
+
+    // Suspension stats
+    $fraudStats['active_suspensions'] = (int) $wpdb->get_var("
+        SELECT COUNT(*) FROM {$suspensionsTable}
+        WHERE unsuspended_at IS NULL
+    ");
+
     // Get high fraud users
     $highFraudUsers = $wpdb->get_results("
         SELECT user_id, display_name, user_email, fraud_score, risk_level, 
-               is_suspended, fraud_triggers, votes_cast, pages_owned, groups_owned
+               is_suspended, fraud_triggers, votes_cast, pages_owned, groups_owned,
+               automation_score, behavior_score
         FROM {$userInfoTable}
         WHERE fraud_score > 50
         ORDER BY fraud_score DESC
@@ -1161,15 +1340,17 @@ function bcc_trust_render_fraud_tab() {
             'fraud_score' => $user->fraud_score,
             'risk_level' => $user->risk_level,
             'suspended' => $user->is_suspended,
-            'confidence' => $user->fraud_score, // Use fraud score as confidence
-            'triggers' => $triggers
+            'confidence' => $user->fraud_score,
+            'triggers' => $triggers,
+            'automation' => $user->automation_score,
+            'behavior' => $user->behavior_score
         ];
     }
 
-    // Get recent fraud alerts
+    // Get recent fraud alerts (using action patterns without metadata)
     $recentFraud = $wpdb->get_results("
         SELECT * FROM {$auditTable}
-        WHERE action LIKE '%fraud%' OR action LIKE '%suspicious%'
+        WHERE action LIKE '%fraud%' OR action LIKE '%suspicious%' OR action LIKE '%flag%'
         ORDER BY created_at DESC
         LIMIT 20
     ");
@@ -1190,13 +1371,13 @@ function bcc_trust_render_fraud_tab() {
         </div>
 
         <div class="stat-card" style="background: #fff; padding: 20px; border: 1px solid #ccd0d4;">
-            <h3>High Risk Users</h3>
-            <div class="stat-value" style="font-size: 32px; font-weight: bold;"><?php echo number_format($fraudStats['risk_distribution']['high'] ?? 0); ?></div>
+            <h3>Active Suspensions</h3>
+            <div class="stat-value" style="font-size: 32px; font-weight: bold;"><?php echo number_format($fraudStats['active_suspensions'] ?? 0); ?></div>
         </div>
 
         <div class="stat-card" style="background: #fff; padding: 20px; border: 1px solid #ccd0d4;">
-            <h3>Critical Risk</h3>
-            <div class="stat-value" style="font-size: 32px; font-weight: bold;"><?php echo number_format($fraudStats['risk_distribution']['critical'] ?? 0); ?></div>
+            <h3>Critical Analyses</h3>
+            <div class="stat-value" style="font-size: 32px; font-weight: bold;"><?php echo number_format($fraudStats['critical_analyses'] ?? 0); ?></div>
         </div>
     </div>
 
@@ -1238,7 +1419,8 @@ function bcc_trust_render_fraud_tab() {
                 <th>User</th>
                 <th>Fraud Score</th>
                 <th>Risk Level</th>
-                <th>Confidence</th>
+                <th>Automation</th>
+                <th>Behavior</th>
                 <th>Triggers</th>
                 <th>Suspended</th>
                 <th>Actions</th>
@@ -1265,7 +1447,8 @@ function bcc_trust_render_fraud_tab() {
                             <?php echo esc_html(ucfirst($user['risk_level'])); ?>
                         </span>
                     </td>
-                    <td><?php echo $user['confidence']; ?>%</td>
+                    <td><?php echo $user['automation']; ?>%</td>
+                    <td><?php echo $user['behavior']; ?></td>
                     <td>
                         <?php 
                         $triggers = array_slice($user['triggers'], 0, 3);
@@ -1290,7 +1473,6 @@ function bcc_trust_render_fraud_tab() {
                 <th>Time</th>
                 <th>Action</th>
                 <th>User</th>
-                <th>Details</th>
             </tr>
         </thead>
         <tbody>
@@ -1303,13 +1485,6 @@ function bcc_trust_render_fraud_tab() {
                             <a href="<?php echo admin_url('admin.php?page=bcc-trust-moderation&user_id=' . $alert->user_id); ?>">
                                 User #<?php echo $alert->user_id; ?>
                             </a>
-                        <?php else: ?>
-                            —
-                        <?php endif; ?>
-                    </td>
-                    <td>
-                        <?php if ($alert->metadata): ?>
-                            <pre style="margin:0; font-size:10px; max-height:60px; overflow:auto;"><?php echo esc_html(substr($alert->metadata, 0, 200)); ?></pre>
                         <?php else: ?>
                             —
                         <?php endif; ?>
@@ -1706,7 +1881,7 @@ function bcc_trust_render_rings_tab() {
 }
 
 /**
- * ML Insights Tab - Machine Learning Data (UPDATED to use user_info table)
+ * ML Insights Tab - Machine Learning Data
  */
 function bcc_trust_render_ml_tab() {
     global $wpdb;
@@ -1853,7 +2028,6 @@ function bcc_trust_render_ml_tab() {
                 <th>User</th>
                 <th>Pattern Type</th>
                 <th>Confidence</th>
-                <th>Data</th>
                 <th>Detected</th>
                 <th>Expires</th>
             </tr>
@@ -1872,392 +2046,12 @@ function bcc_trust_render_ml_tab() {
                     </td>
                     <td><?php echo esc_html($pattern->pattern_type); ?></td>
                     <td><?php echo round($pattern->confidence * 100, 1); ?>%</td>
-                    <td>
-                        <?php 
-                        $data = json_decode($pattern->pattern_data, true);
-                        if (is_array($data)) {
-                            echo '<pre style="margin:0; font-size:10px; max-height:60px; overflow:auto;">' . esc_html(json_encode($data, JSON_PRETTY_PRINT)) . '</pre>';
-                        } else {
-                            echo '—';
-                        }
-                        ?>
-                    </td>
                     <td><?php echo date('Y-m-d H:i', strtotime($pattern->detected_at)); ?></td>
                     <td><?php echo $pattern->expires_at ? date('Y-m-d H:i', strtotime($pattern->expires_at)) : 'Never'; ?></td>
                 </tr>
             <?php endforeach; ?>
         </tbody>
     </table>
-    <?php
-}
-
-/**
- * All Pages Tab - Shows EVERY page with trust scores
- */
-function bcc_trust_render_all_pages_tab() {
-    global $wpdb;
-    
-    // Get current page for pagination
-    $current_page = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
-    $per_page = 20;
-    $offset = ($current_page - 1) * $per_page;
-    
-    // Get filter/sort parameters
-    $search = isset($_GET['s']) ? sanitize_text_field($_GET['s']) : '';
-    $tier_filter = isset($_GET['tier']) ? sanitize_key($_GET['tier']) : '';
-    $status_filter = isset($_GET['status']) ? sanitize_key($_GET['status']) : '';
-    $orderby = isset($_GET['orderby']) ? sanitize_key($_GET['orderby']) : 'total_score';
-    $order = isset($_GET['order']) && strtoupper($_GET['order']) === 'ASC' ? 'ASC' : 'DESC';
-    
-    // Build WHERE clause
-    $where = "1=1";
-    $params = [];
-    
-    if ($search) {
-        $where .= " AND (p.post_title LIKE %s OR p.ID LIKE %s)";
-        $params[] = '%' . $wpdb->esc_like($search) . '%';
-        $params[] = '%' . $wpdb->esc_like($search) . '%';
-    }
-    
-    if ($tier_filter) {
-        $where .= " AND s.reputation_tier = %s";
-        $params[] = $tier_filter;
-    }
-    
-    if ($status_filter === 'with_scores') {
-        $where .= " AND s.id IS NOT NULL";
-    } elseif ($status_filter === 'without_scores') {
-        $where .= " AND s.id IS NULL";
-    } elseif ($status_filter === 'published') {
-        $where .= " AND p.post_status = 'publish'";
-    } elseif ($status_filter === 'draft') {
-        $where .= " AND p.post_status = 'draft'";
-    } elseif ($status_filter === 'private') {
-        $where .= " AND p.post_status = 'private'";
-    } elseif ($status_filter === 'trash') {
-        $where .= " AND p.post_status = 'trash'";
-    }
-    
-    // Get ALL PeepSo pages with their trust scores (if any)
-    $sql = "SELECT 
-                p.ID as page_id,
-                p.post_title as page_title,
-                p.post_author as page_owner_id,
-                p.post_status as page_status,
-                p.post_date as page_created,
-                s.*,
-                u.display_name as owner_name,
-                u.user_email as owner_email,
-                u.user_login as owner_login
-            FROM {$wpdb->posts} p
-            LEFT JOIN " . bcc_trust_scores_table() . " s ON p.ID = s.page_id
-            LEFT JOIN {$wpdb->users} u ON p.post_author = u.ID
-            WHERE p.post_type = 'peepso-page'
-            AND {$where}
-            ORDER BY ";
-    
-    // Validate orderby to prevent SQL injection
-    $valid_orderby = ['total_score', 'vote_count', 'confidence_score', 'page_id', 'post_title', 'post_date'];
-    if (in_array($orderby, $valid_orderby)) {
-        if ($orderby === 'post_title' || $orderby === 'post_date') {
-            $sql .= "p.{$orderby} {$order}";
-        } elseif ($orderby === 'page_id') {
-            $sql .= "p.ID {$order}";
-        } else {
-            $sql .= "COALESCE(s.{$orderby}, 0) {$order}";
-        }
-    } else {
-        $sql .= "COALESCE(s.total_score, 0) DESC, p.ID DESC";
-    }
-    
-    // Get total count for pagination
-    $count_sql = "SELECT COUNT(*) FROM {$wpdb->posts} p 
-                  WHERE p.post_type = 'peepso-page' AND {$where}";
-    if (!empty($params)) {
-        $count_sql = $wpdb->prepare($count_sql, $params);
-    }
-    $total_items = $wpdb->get_var($count_sql);
-    
-    // Add limit for current page
-    $sql .= " LIMIT %d OFFSET %d";
-    $params[] = $per_page;
-    $params[] = $offset;
-    
-    if (!empty($params)) {
-        $sql = $wpdb->prepare($sql, $params);
-    }
-    
-    $pages = $wpdb->get_results($sql);
-    
-    // Get tier counts for filter dropdown
-    $tier_counts = $wpdb->get_results("
-        SELECT reputation_tier, COUNT(*) as count 
-        FROM " . bcc_trust_scores_table() . " 
-        GROUP BY reputation_tier
-    ");
-    $tier_counts_assoc = [];
-    foreach ($tier_counts as $tc) {
-        $tier_counts_assoc[$tc->reputation_tier] = $tc->count;
-    }
-    
-    // Get status counts
-    $status_counts = $wpdb->get_results("
-        SELECT post_status, COUNT(*) as count 
-        FROM {$wpdb->posts} 
-        WHERE post_type = 'peepso-page'
-        GROUP BY post_status
-    ");
-    $status_counts_assoc = [];
-    foreach ($status_counts as $sc) {
-        $status_counts_assoc[$sc->post_status] = $sc->count;
-    }
-    
-    $scores_count = $wpdb->get_var("SELECT COUNT(*) FROM " . bcc_trust_scores_table());
-   ?>
-    
-    <div class="wrap">
-        <h2>All PeepSo Pages</h2>
-        
-        <!-- Filter Bar -->
-        <div class="tablenav top">
-            <form method="get" style="display: inline-block; width: 100%;">
-                <input type="hidden" name="page" value="bcc-trust-dashboard">
-                <input type="hidden" name="tab" value="all-pages">
-                
-                <div class="alignleft actions">
-                    <select name="tier">
-                        <option value="">All Tiers</option>
-                        <option value="elite" <?php selected($tier_filter, 'elite'); ?>>Elite (<?php echo $tier_counts_assoc['elite'] ?? 0; ?>)</option>
-                        <option value="trusted" <?php selected($tier_filter, 'trusted'); ?>>Trusted (<?php echo $tier_counts_assoc['trusted'] ?? 0; ?>)</option>
-                        <option value="neutral" <?php selected($tier_filter, 'neutral'); ?>>Neutral (<?php echo $tier_counts_assoc['neutral'] ?? 0; ?>)</option>
-                        <option value="caution" <?php selected($tier_filter, 'caution'); ?>>Caution (<?php echo $tier_counts_assoc['caution'] ?? 0; ?>)</option>
-                        <option value="risky" <?php selected($tier_filter, 'risky'); ?>>Risky (<?php echo $tier_counts_assoc['risky'] ?? 0; ?>)</option>
-                    </select>
-                    
-                    <select name="status">
-                        <option value="">All Statuses</option>
-                        <option value="published" <?php selected($status_filter, 'published'); ?>>Published (<?php echo $status_counts_assoc['publish'] ?? 0; ?>)</option>
-                        <option value="private" <?php selected($status_filter, 'private'); ?>>Private (<?php echo $status_counts_assoc['private'] ?? 0; ?>)</option>
-                        <option value="draft" <?php selected($status_filter, 'draft'); ?>>Draft (<?php echo $status_counts_assoc['draft'] ?? 0; ?>)</option>
-                        <option value="trash" <?php selected($status_filter, 'trash'); ?>>Trash (<?php echo $status_counts_assoc['trash'] ?? 0; ?>)</option>
-                        <option value="with_scores" <?php selected($status_filter, 'with_scores'); ?>>With Trust Scores (<?php echo $scores_count; ?>)</option>
-                        <option value="without_scores" <?php selected($status_filter, 'without_scores'); ?>>Without Scores (<?php echo $total_items - $scores_count; ?>)</option>
-                    </select>
-                    
-                    <select name="orderby">
-                        <option value="total_score" <?php selected($orderby, 'total_score'); ?>>Sort by Trust Score</option>
-                        <option value="vote_count" <?php selected($orderby, 'vote_count'); ?>>Sort by Vote Count</option>
-                        <option value="confidence_score" <?php selected($orderby, 'confidence_score'); ?>>Sort by Confidence</option>
-                        <option value="post_date" <?php selected($orderby, 'post_date'); ?>>Sort by Creation Date</option>
-                        <option value="post_title" <?php selected($orderby, 'post_title'); ?>>Sort by Title</option>
-                        <option value="page_id" <?php selected($orderby, 'page_id'); ?>>Sort by Page ID</option>
-                    </select>
-                    
-                    <select name="order">
-                        <option value="DESC" <?php selected($order, 'DESC'); ?>>Descending</option>
-                        <option value="ASC" <?php selected($order, 'ASC'); ?>>Ascending</option>
-                    </select>
-                    
-                    <input type="submit" class="button" value="Apply Filters">
-                </div>
-                
-                <div class="alignright">
-                    <input type="search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="Search pages...">
-                    <input type="submit" class="button" value="Search">
-                </div>
-            </form>
-        </div>
-        
-        <!-- Pages Table -->
-        <table class="wp-list-table widefat fixed striped">
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Page</th>
-                    <th>Owner</th>
-                    <th>Status</th>
-                    <th>Trust Score</th>
-                    <th>Tier</th>
-                    <th>Votes</th>
-                    <th>Endorsements</th>
-                    <th>Confidence</th>
-                    <th>Created</th>
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php if (empty($pages)): ?>
-                    <tr>
-                        <td colspan="11" style="text-align:center; padding:20px;">
-                            <strong>No pages found matching your criteria.</strong>
-                        </td>
-                    </tr>
-                <?php else: ?>
-                    <?php foreach ($pages as $page): 
-                        $has_score = !empty($page->total_score);
-                        $tier_info = $has_score ? bcc_trust_get_tier_info($page->reputation_tier) : ['color' => '#999', 'icon' => '❓'];
-                        
-                        // Determine status color
-                        $status_color = '#999';
-                        $status_label = $page->page_status;
-                        switch ($page->page_status) {
-                            case 'publish':
-                                $status_color = '#4caf50';
-                                $status_label = 'Published';
-                                break;
-                            case 'private':
-                                $status_color = '#ff9800';
-                                $status_label = 'Private';
-                                break;
-                            case 'draft':
-                                $status_color = '#f44336';
-                                $status_label = 'Draft';
-                                break;
-                            case 'trash':
-                                $status_color = '#9e9e9e';
-                                $status_label = 'Trash';
-                                break;
-                            default:
-                                $status_color = '#999';
-                                $status_label = ucfirst($page->page_status);
-                        }
-                        
-                        // Handle owner information - post_author = 0 is common for system pages
-                        $has_owner = !empty($page->page_owner_id) && $page->page_owner_id > 0;
-                        $owner_display = 'System';
-                        $owner_link = '#';
-                        
-                        if ($has_owner) {
-                            if (!empty($page->owner_name)) {
-                                $owner_display = $page->owner_name;
-                            } elseif (!empty($page->owner_login)) {
-                                $owner_display = $page->owner_login;
-                            } else {
-                                // Try to get user directly
-                                $user = get_userdata($page->page_owner_id);
-                                if ($user) {
-                                    $owner_display = $user->display_name ?: $user->user_login;
-                                } else {
-                                    $owner_display = 'User #' . $page->page_owner_id . ' (deleted)';
-                                }
-                            }
-                            $owner_link = admin_url('admin.php?page=bcc-trust-moderation&user_id=' . $page->page_owner_id);
-                        }
-                    ?>
-                        <tr>
-                            <td><strong>#<?php echo $page->page_id; ?></strong></td>
-                            <td>
-                                <strong><?php echo esc_html($page->page_title ?: 'Untitled'); ?></strong>
-                                <?php if (empty($page->page_title)): ?>
-                                    <br><small style="color: #999;">(no title)</small>
-                                <?php endif; ?>
-                            </td>
-                            <td>
-                                <?php if ($has_owner): ?>
-                                    <a href="<?php echo esc_url($owner_link); ?>" title="User ID: <?php echo $page->page_owner_id; ?>">
-                                        <?php echo esc_html($owner_display); ?>
-                                    </a>
-                                <?php else: ?>
-                                    <span style="color: #999;"><?php echo $owner_display; ?></span>
-                                <?php endif; ?>
-                            </td>
-                            <td>
-                                <span style="background: <?php echo $status_color; ?>; color: #fff; padding: 3px 8px; border-radius: 3px; display: inline-block; font-size: 11px;">
-                                    <?php echo esc_html($status_label); ?>
-                                </span>
-                            </td>
-                            <td>
-                                <?php if ($has_score): ?>
-                                    <strong><?php echo number_format($page->total_score, 1); ?></strong>
-                                <?php else: ?>
-                                    <em style="color: #999;">No score yet</em>
-                                <?php endif; ?>
-                            </td>
-                            <td>
-                                <?php if ($has_score): ?>
-                                    <span style="padding: 3px 8px; border-radius: 3px; background: <?php echo $tier_info['color']; ?>; color: #fff; display: inline-block; font-size: 11px;">
-                                        <?php echo $tier_info['icon']; ?> <?php echo esc_html(ucfirst($page->reputation_tier)); ?>
-                                    </span>
-                                <?php else: ?>
-                                    <span style="color: #999;">—</span>
-                                <?php endif; ?>
-                            </td>
-                            <td><?php echo $has_score ? number_format($page->vote_count) : '0'; ?></td>
-                            <td><?php echo $has_score ? number_format($page->endorsement_count) : '0'; ?></td>
-                            <td>
-                                <?php if ($has_score && $page->confidence_score > 0): ?>
-                                    <div style="display:flex; align-items:center;">
-                                        <div style="width:50px; height:6px; background:#eee; border-radius:3px; margin-right:8px;">
-                                            <div style="width:<?php echo $page->confidence_score * 100; ?>%; height:6px; background:#2196f3; border-radius:3px;"></div>
-                                        </div>
-                                        <?php echo round($page->confidence_score * 100); ?>%
-                                    </div>
-                                <?php else: ?>
-                                    —
-                                <?php endif; ?>
-                            </td>
-                            <td><?php echo date('Y-m-d', strtotime($page->page_created)); ?></td>
-                            <td>
-                                <a href="<?php echo get_permalink($page->page_id); ?>" class="button button-small" target="_blank">View</a>
-                                <?php if ($has_owner): ?>
-                                    <a href="<?php echo esc_url($owner_link); ?>" class="button button-small">Owner</a>
-                                <?php endif; ?>
-                                <?php if (!$has_score): ?>
-                                    <button class="button button-small" onclick="initializePageScore(<?php echo $page->page_id; ?>)">Init</button>
-                                <?php endif; ?>
-                            </td>
-                        </tr>
-                    <?php endforeach; ?>
-                <?php endif; ?>
-            </tbody>
-        </table>
-        
-        <!-- Pagination -->
-        <?php
-        $total_pages = ceil($total_items / $per_page);
-        if ($total_pages > 1):
-        ?>
-        <div class="tablenav bottom">
-            <div class="tablenav-pages">
-                <span class="displaying-num"><?php echo number_format($total_items); ?> items</span>
-                <?php
-                echo paginate_links([
-                    'base' => add_query_arg('paged', '%#%'),
-                    'format' => '',
-                    'prev_text' => '&laquo;',
-                    'next_text' => '&raquo;',
-                    'total' => $total_pages,
-                    'current' => $current_page
-                ]);
-                ?>
-            </div>
-        </div>
-        <?php endif; ?>
-    </div>
-    
-    <script>
-    function initializePageScore(pageId) {
-        if (confirm('Initialize trust score for this page? This will create a default score of 50.')) {
-            jQuery.ajax({
-                url: ajaxurl,
-                type: 'POST',
-                data: {
-                    action: 'bcc_trust_init_page_score',
-                    page_id: pageId,
-                    nonce: '<?php echo wp_create_nonce('bcc_trust_admin'); ?>'
-                },
-                success: function(response) {
-                    if (response.success) {
-                        alert('Score initialized successfully!');
-                        location.reload();
-                    } else {
-                        alert('Error: ' + response.data);
-                    }
-                }
-            });
-        }
-    }
-    </script>
     <?php
 }
 
@@ -2269,64 +2063,12 @@ function bcc_trust_render_repair_tab() {
     <div class="wrap">
         <h2>🔧 Repair & Sync Tools</h2>
         
+        <!-- Diagnostics -->
+        <?php bcc_trust_show_repair_diagnostics(); ?>
+        
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-top: 20px;">
-        
-        <?php 
             
-function bcc_trust_show_repair_diagnostics() {
-    global $wpdb;
-    
-    $scoresTable = bcc_trust_scores_table();
-    $postsTable = $wpdb->posts;
-    
-    // Pages with mismatched owners
-    $mismatches = $wpdb->get_results("
-        SELECT s.page_id, p.post_title, s.page_owner_id as score_owner, p.post_author as post_author
-        FROM {$scoresTable} s
-        JOIN {$postsTable} p ON s.page_id = p.ID
-        WHERE s.page_owner_id != p.post_author
-    ");
-    
-    // Pages missing from scores table
-    $missing = $wpdb->get_results("
-        SELECT p.ID, p.post_title, p.post_author
-        FROM {$postsTable} p
-        LEFT JOIN {$scoresTable} s ON p.ID = s.page_id
-        WHERE p.post_type = 'peepso-page'
-        AND s.page_id IS NULL
-    ");
-    
-    echo '<div style="background: #fff; padding: 20px; margin: 20px 0; border: 1px solid #ccd0d4;">';
-    echo '<h3>🔍 Repair Diagnostics</h3>';
-    
-    if (empty($mismatches) && empty($missing)) {
-        echo '<p style="color: #4caf50;">✅ All pages have correct owner assignments and score entries!</p>';
-    } else {
-        if (!empty($mismatches)) {
-            echo '<p style="color: #f44336;">⚠️ ' . count($mismatches) . ' pages have mismatched owners:</p>';
-            echo '<ul>';
-            foreach ($mismatches as $page) {
-                echo '<li>Page #' . $page->page_id . ' "' . esc_html($page->post_title) . '" - Score owner: ' . $page->score_owner . ', Post author: ' . $page->post_author . '</li>';
-            }
-            echo '</ul>';
-        }
-        
-        if (!empty($missing)) {
-            echo '<p style="color: #ff9800;">⚠️ ' . count($missing) . ' pages missing score entries:</p>';
-            echo '<ul>';
-            foreach ($missing as $page) {
-                echo '<li>Page #' . $page->ID . ' "' . esc_html($page->post_title) . '" (Author: ' . $page->post_author . ')</li>';
-            }
-            echo '</ul>';
-        }
-    }
-    
-    echo '</div>';
-}
-?>
-        
-        <!-- Page-Owner Repair Card -->
-
+            <!-- Page-Owner Repair Card -->
             <div style="background: #fff; padding: 20px; border: 1px solid #ccd0d4; border-radius: 5px;">
                 <h3 style="margin-top: 0; color: #23282d;">📄 Page-Owner Repair</h3>
                 <p>Fix relationships between pages and their owners. This will:</p>
@@ -2409,6 +2151,22 @@ function bcc_trust_show_repair_diagnostics() {
                 </a>
             </div>
             
+            <!-- Fraud Analysis Cleanup Card -->
+            <div style="background: #fff; padding: 20px; border: 1px solid #ccd0d4; border-radius: 5px;">
+                <h3 style="margin-top: 0; color: #23282d;">🔍 Fraud Analysis Cleanup</h3>
+                <p>Clean up old fraud analysis records:</p>
+                <ul style="margin-bottom: 20px;">
+                    <li>✓ Remove old fraud analyses (>90 days)</li>
+                    <li>✓ Archive completed investigations</li>
+                    <li>✓ Optimize fraud tables</li>
+                </ul>
+                <a href="<?php echo admin_url('admin.php?page=bcc-trust-dashboard&tab=repair&action=clean_fraud'); ?>" 
+                   class="button button-primary" 
+                   onclick="return confirm('Run fraud analysis cleanup?');">
+                    🧹 Clean Fraud Data
+                </a>
+            </div>
+            
             <!-- Full System Repair Card -->
             <div style="background: #fff; padding: 20px; border: 1px solid #ccd0d4; border-radius: 5px; border-left: 4px solid #46b450;">
                 <h3 style="margin-top: 0; color: #23282d;">🔄 Complete System Repair</h3>
@@ -2418,6 +2176,8 @@ function bcc_trust_show_repair_diagnostics() {
                     <li>2. User Info Sync</li>
                     <li>3. Database Check</li>
                     <li>4. Score Recalculation</li>
+                    <li>5. Device Cleanup</li>
+                    <li>6. Fraud Analysis Cleanup</li>
                 </ol>
                 <a href="<?php echo admin_url('admin.php?page=bcc-trust-dashboard&tab=repair&action=complete_repair'); ?>" 
                    class="button button-primary button-hero" 
@@ -2445,6 +2205,9 @@ function bcc_trust_show_repair_diagnostics() {
                 case 'clean_devices':
                     bcc_trust_run_device_cleanup();
                     break;
+                case 'clean_fraud':
+                    bcc_trust_run_fraud_cleanup();
+                    break;
                 case 'complete_repair':
                     bcc_trust_run_complete_repair();
                     break;
@@ -2466,8 +2229,113 @@ function bcc_trust_show_repair_diagnostics() {
     </div>
     <?php
 }
+
 /**
- * Run Owner Repair - FIXED VERSION
+ * Show repair diagnostics
+ */
+function bcc_trust_show_repair_diagnostics() {
+    global $wpdb;
+    
+    $scoresTable = bcc_trust_scores_table();
+    $postsTable = $wpdb->posts;
+    $userInfoTable = bcc_trust_user_info_table();
+    $fraudAnalysisTable = bcc_trust_fraud_analysis_table();
+    $suspensionsTable = bcc_trust_suspensions_table();
+    
+    // Pages with mismatched owners
+    $mismatches = $wpdb->get_results("
+        SELECT s.page_id, p.post_title, s.page_owner_id as score_owner, p.post_author as post_author
+        FROM {$scoresTable} s
+        JOIN {$postsTable} p ON s.page_id = p.ID
+        WHERE s.page_owner_id != p.post_author
+    ");
+    
+    // Pages missing from scores table
+    $missing = $wpdb->get_results("
+        SELECT p.ID, p.post_title, p.post_author
+        FROM {$postsTable} p
+        LEFT JOIN {$scoresTable} s ON p.ID = s.page_id
+        WHERE p.post_type = 'peepso-page'
+        AND s.page_id IS NULL
+    ");
+    
+    // Users missing from user_info table
+    $missing_users = $wpdb->get_results("
+        SELECT u.ID, u.user_login, u.user_email
+        FROM {$wpdb->users} u
+        LEFT JOIN {$userInfoTable} ui ON u.ID = ui.user_id
+        WHERE ui.user_id IS NULL
+        LIMIT 10
+    ");
+    
+    // Fraud analysis orphaned
+    $orphaned_fraud = $wpdb->get_var("
+        SELECT COUNT(*) FROM {$fraudAnalysisTable} fa
+        LEFT JOIN {$wpdb->users} u ON fa.user_id = u.ID
+        WHERE u.ID IS NULL
+    ");
+    
+    // Suspensions orphaned
+    $orphaned_suspensions = $wpdb->get_var("
+        SELECT COUNT(*) FROM {$suspensionsTable} s
+        LEFT JOIN {$wpdb->users} u ON s.user_id = u.ID
+        WHERE u.ID IS NULL
+    ");
+    
+    echo '<div style="background: #fff; padding: 20px; margin: 20px 0; border: 1px solid #ccd0d4;">';
+    echo '<h3>🔍 Repair Diagnostics</h3>';
+    
+    $issues_found = false;
+    
+    if (!empty($mismatches)) {
+        echo '<p style="color: #f44336;">⚠️ ' . count($mismatches) . ' pages have mismatched owners:</p>';
+        echo '<ul>';
+        foreach ($mismatches as $page) {
+            echo '<li>Page #' . $page->page_id . ' "' . esc_html($page->post_title) . '" - Score owner: ' . $page->score_owner . ', Post author: ' . $page->post_author . '</li>';
+        }
+        echo '</ul>';
+        $issues_found = true;
+    }
+    
+    if (!empty($missing)) {
+        echo '<p style="color: #ff9800;">⚠️ ' . count($missing) . ' pages missing score entries:</p>';
+        echo '<ul>';
+        foreach ($missing as $page) {
+            echo '<li>Page #' . $page->ID . ' "' . esc_html($page->post_title) . '" (Author: ' . $page->post_author . ')</li>';
+        }
+        echo '</ul>';
+        $issues_found = true;
+    }
+    
+    if (!empty($missing_users)) {
+        echo '<p style="color: #ff9800;">⚠️ ' . count($missing_users) . ' users missing from user_info table (showing first 10):</p>';
+        echo '<ul>';
+        foreach ($missing_users as $user) {
+            echo '<li>User #' . $user->ID . ' ' . esc_html($user->user_login) . ' (' . esc_html($user->user_email) . ')</li>';
+        }
+        echo '</ul>';
+        $issues_found = true;
+    }
+    
+    if ($orphaned_fraud) {
+        echo '<p style="color: #ff9800;">⚠️ ' . $orphaned_fraud . ' orphaned fraud analysis records found.</p>';
+        $issues_found = true;
+    }
+    
+    if ($orphaned_suspensions) {
+        echo '<p style="color: #ff9800;">⚠️ ' . $orphaned_suspensions . ' orphaned suspension records found.</p>';
+        $issues_found = true;
+    }
+    
+    if (!$issues_found) {
+        echo '<p style="color: #4caf50;">✅ All systems are healthy! No issues detected.</p>';
+    }
+    
+    echo '</div>';
+}
+
+/**
+ * Run Owner Repair
  */
 function bcc_trust_run_owner_repair() {
     global $wpdb;
@@ -2667,6 +2535,7 @@ function bcc_trust_run_owner_repair() {
     wp_redirect(admin_url('admin.php?page=bcc-trust-dashboard&tab=repair'));
     exit;
 }
+
 /**
  * Run Database Check
  */
@@ -2687,7 +2556,9 @@ function bcc_trust_run_db_check() {
         'user_info' => bcc_trust_user_info_table(),
         'fingerprints' => bcc_trust_fingerprints_table(),
         'patterns' => bcc_trust_patterns_table(),
-        'activity' => bcc_trust_activity_table()
+        'activity' => bcc_trust_activity_table(),
+        'fraud_analysis' => bcc_trust_fraud_analysis_table(),
+        'suspensions' => bcc_trust_suspensions_table()
     ];
     
     foreach ($tables as $name => $table) {
@@ -2728,6 +2599,40 @@ function bcc_trust_run_db_check() {
                         DELETE u FROM {$table} u
                         LEFT JOIN {$wpdb->users} w ON u.user_id = w.ID
                         WHERE w.ID IS NULL
+                    ");
+                    $results['issues_fixed'] += $orphaned;
+                }
+            }
+            
+            if ($name == 'fraud_analysis') {
+                $orphaned = $wpdb->get_var("
+                    SELECT COUNT(*) FROM {$table} fa
+                    LEFT JOIN {$wpdb->users} u ON fa.user_id = u.ID
+                    WHERE u.ID IS NULL
+                ");
+                if ($orphaned > 0) {
+                    $results['issues_found'][] = "Found {$orphaned} orphaned fraud analysis records";
+                    $wpdb->query("
+                        DELETE fa FROM {$table} fa
+                        LEFT JOIN {$wpdb->users} u ON fa.user_id = u.ID
+                        WHERE u.ID IS NULL
+                    ");
+                    $results['issues_fixed'] += $orphaned;
+                }
+            }
+            
+            if ($name == 'suspensions') {
+                $orphaned = $wpdb->get_var("
+                    SELECT COUNT(*) FROM {$table} s
+                    LEFT JOIN {$wpdb->users} u ON s.user_id = u.ID
+                    WHERE u.ID IS NULL
+                ");
+                if ($orphaned > 0) {
+                    $results['issues_found'][] = "Found {$orphaned} orphaned suspension records";
+                    $wpdb->query("
+                        DELETE s FROM {$table} s
+                        LEFT JOIN {$wpdb->users} u ON s.user_id = u.ID
+                        WHERE u.ID IS NULL
                     ");
                     $results['issues_fixed'] += $orphaned;
                 }
@@ -2854,6 +2759,46 @@ function bcc_trust_run_device_cleanup() {
 }
 
 /**
+ * Run Fraud Analysis Cleanup
+ */
+function bcc_trust_run_fraud_cleanup() {
+    global $wpdb;
+    
+    $results = [
+        'action' => 'fraud_cleanup',
+        'fraud_analyses_removed' => 0,
+        'suspensions_archived' => 0
+    ];
+    
+    $fraudAnalysisTable = bcc_trust_fraud_analysis_table();
+    $suspensionsTable = bcc_trust_suspensions_table();
+    
+    // Remove old fraud analyses
+    $cutoff = date('Y-m-d H:i:s', strtotime('-90 days'));
+    $results['fraud_analyses_removed'] = $wpdb->query(
+        $wpdb->prepare(
+            "DELETE FROM {$fraudAnalysisTable} WHERE expires_at < %s OR (expires_at IS NULL AND analyzed_at < %s)",
+            current_time('mysql'),
+            $cutoff
+        )
+    );
+    
+    // Archive old resolved suspensions
+    $results['suspensions_archived'] = $wpdb->query(
+        $wpdb->prepare(
+            "UPDATE {$suspensionsTable} SET notes = CONCAT(notes, ' [ARCHIVED]') 
+             WHERE unsuspended_at IS NOT NULL 
+             AND unsuspended_at < %s",
+            date('Y-m-d H:i:s', strtotime('-30 days'))
+        )
+    );
+    
+    set_transient('bcc_trust_repair_results', $results, 60);
+    wp_redirect(admin_url('admin.php?page=bcc-trust-dashboard&tab=repair'));
+    exit;
+}
+
+/**
  * Run Complete Repair
  */
 function bcc_trust_run_complete_repair() {
@@ -2883,6 +2828,18 @@ function bcc_trust_run_complete_repair() {
     ob_start();
     bcc_trust_run_score_recalc();
     $results['steps']['score_recalc'] = get_transient('bcc_trust_repair_results');
+    delete_transient('bcc_trust_repair_results');
+    
+    // Step 5: Device Cleanup
+    ob_start();
+    bcc_trust_run_device_cleanup();
+    $results['steps']['device_cleanup'] = get_transient('bcc_trust_repair_results');
+    delete_transient('bcc_trust_repair_results');
+    
+    // Step 6: Fraud Cleanup
+    ob_start();
+    bcc_trust_run_fraud_cleanup();
+    $results['steps']['fraud_cleanup'] = get_transient('bcc_trust_repair_results');
     delete_transient('bcc_trust_repair_results');
     
     set_transient('bcc_trust_repair_results', $results, 120);

@@ -33,7 +33,7 @@ function bcc_trust_get_user_vote($page_id, $voter_user_id) {
     return $wpdb->get_row(
         $wpdb->prepare(
             "SELECT * FROM {$table}
-             WHERE page_id = %d AND voter_user_id = %d
+             WHERE page_id = %d AND voter_user_id = %d AND status = 1
              LIMIT 1",
             $page_id,
             $voter_user_id
@@ -42,26 +42,27 @@ function bcc_trust_get_user_vote($page_id, $voter_user_id) {
 }
 
 /**
- * Get user's active vote with fraud score
+ * Get user's active vote with fraud context
  *
  * @param int $page_id
  * @param int $user_id
  * @return object|null
  */
-function bcc_trust_db_get_user_vote_enhanced($page_id, $user_id) {
+function bcc_trust_get_user_vote_enhanced($page_id, $user_id) {
     global $wpdb;
     $votes_table = bcc_trust_votes_table();
+    $user_info_table = bcc_trust_user_info_table();
     $fingerprint_table = bcc_trust_fingerprints_table();
 
     return $wpdb->get_row($wpdb->prepare(
         "SELECT v.*, 
-                COALESCE(uf.meta_value, 0) as fraud_score,
-                f.automation_score,
+                ui.fraud_score,
+                ui.automation_score,
+                ui.risk_level,
+                f.automation_score as device_automation,
                 f.risk_level as device_risk
          FROM {$votes_table} v
-         LEFT JOIN {$wpdb->usermeta} uf 
-            ON v.voter_user_id = uf.user_id 
-            AND uf.meta_key = 'bcc_trust_fraud_score'
+         LEFT JOIN {$user_info_table} ui ON v.voter_user_id = ui.user_id
          LEFT JOIN {$fingerprint_table} f
             ON v.voter_user_id = f.user_id
             AND f.id = (
@@ -86,26 +87,26 @@ function bcc_trust_db_get_user_vote_enhanced($page_id, $user_id) {
  * @param bool $include_suspicious_only
  * @return array
  */
-function bcc_trust_db_get_page_votes_with_fraud($page_id, $include_suspicious_only = false) {
+function bcc_trust_get_page_votes_with_fraud($page_id, $include_suspicious_only = false) {
     global $wpdb;
     $votes_table = bcc_trust_votes_table();
+    $user_info_table = bcc_trust_user_info_table();
     $fingerprint_table = bcc_trust_fingerprints_table();
 
     $suspicious_clause = $include_suspicious_only ? 
-        "AND (uf.meta_value > 50 OR f.automation_score > 50)" : "";
+        "AND (ui.fraud_score > 50 OR ui.automation_score > 50)" : "";
 
     return $wpdb->get_results($wpdb->prepare(
         "SELECT v.*, 
                 u.display_name as voter_name,
-                COALESCE(uf.meta_value, 0) as fraud_score,
-                f.automation_score,
-                f.risk_level,
-                f.fingerprint
+                ui.fraud_score,
+                ui.automation_score,
+                ui.risk_level,
+                f.fingerprint,
+                f.automation_score as device_automation
          FROM {$votes_table} v
          LEFT JOIN {$wpdb->users} u ON v.voter_user_id = u.ID
-         LEFT JOIN {$wpdb->usermeta} uf 
-            ON v.voter_user_id = uf.user_id 
-            AND uf.meta_key = 'bcc_trust_fraud_score'
+         LEFT JOIN {$user_info_table} ui ON v.voter_user_id = ui.user_id
          LEFT JOIN {$fingerprint_table} f
             ON v.voter_user_id = f.user_id
             AND f.id = (
@@ -130,10 +131,11 @@ function bcc_trust_db_get_page_votes_with_fraud($page_id, $include_suspicious_on
  * @param int $limit
  * @return array
  */
-function bcc_trust_db_get_suspicious_votes($fraud_threshold = 50, $automation_threshold = 50, $limit = 100) {
+function bcc_trust_get_suspicious_votes($fraud_threshold = 50, $automation_threshold = 50, $limit = 100) {
     global $wpdb;
     $votes_table = bcc_trust_votes_table();
     $scores_table = bcc_trust_scores_table();
+    $user_info_table = bcc_trust_user_info_table();
     $fingerprint_table = bcc_trust_fingerprints_table();
 
     return $wpdb->get_results($wpdb->prepare(
@@ -141,17 +143,15 @@ function bcc_trust_db_get_suspicious_votes($fraud_threshold = 50, $automation_th
                 u.display_name as voter_name,
                 s.page_owner_id,
                 p.post_title as page_title,
-                COALESCE(uf.meta_value, 0) as fraud_score,
-                f.automation_score,
-                f.risk_level,
+                ui.fraud_score,
+                ui.automation_score,
+                ui.risk_level,
                 f.fingerprint
          FROM {$votes_table} v
          JOIN {$scores_table} s ON v.page_id = s.page_id
          LEFT JOIN {$wpdb->posts} p ON v.page_id = p.ID
          LEFT JOIN {$wpdb->users} u ON v.voter_user_id = u.ID
-         LEFT JOIN {$wpdb->usermeta} uf 
-            ON v.voter_user_id = uf.user_id 
-            AND uf.meta_key = 'bcc_trust_fraud_score'
+         LEFT JOIN {$user_info_table} ui ON v.voter_user_id = ui.user_id
          LEFT JOIN {$fingerprint_table} f
             ON v.voter_user_id = f.user_id
             AND f.id = (
@@ -161,8 +161,8 @@ function bcc_trust_db_get_suspicious_votes($fraud_threshold = 50, $automation_th
                 LIMIT 1
             )
          WHERE v.status = 1
-         AND (uf.meta_value > %d OR f.automation_score > %d)
-         ORDER BY GREATEST(uf.meta_value, f.automation_score) DESC
+         AND (ui.fraud_score > %d OR ui.automation_score > %d)
+         ORDER BY GREATEST(ui.fraud_score, ui.automation_score) DESC
          LIMIT %d",
         $fraud_threshold,
         $automation_threshold,
@@ -172,7 +172,81 @@ function bcc_trust_db_get_suspicious_votes($fraud_threshold = 50, $automation_th
 
 /**
  * ======================================================
- * FINGERPRINT QUERIES (NEW)
+ * USER INFO QUERIES (NEW)
+ * ======================================================
+ */
+
+/**
+ * Get user info with fraud data
+ *
+ * @param int $user_id
+ * @return object|null
+ */
+function bcc_trust_get_user_info_enhanced($user_id) {
+    global $wpdb;
+    $table = bcc_trust_user_info_table();
+    
+    return $wpdb->get_row($wpdb->prepare(
+        "SELECT ui.*, 
+                u.display_name,
+                u.user_email,
+                u.user_registered
+         FROM {$table} ui
+         JOIN {$wpdb->users} u ON ui.user_id = u.ID
+         WHERE ui.user_id = %d",
+        $user_id
+    ));
+}
+
+/**
+ * Get users with high fraud scores from user_info table
+ *
+ * @param int $threshold
+ * @param int $limit
+ * @return array
+ */
+function bcc_trust_get_high_risk_users($threshold = 50, $limit = 100) {
+    global $wpdb;
+    $table = bcc_trust_user_info_table();
+
+    return $wpdb->get_results($wpdb->prepare("
+        SELECT ui.*, u.display_name, u.user_email
+        FROM {$table} ui
+        JOIN {$wpdb->users} u ON ui.user_id = u.ID
+        WHERE ui.fraud_score >= %d
+        ORDER BY ui.fraud_score DESC
+        LIMIT %d",
+        $threshold,
+        $limit
+    ));
+}
+
+/**
+ * Get users by risk level
+ *
+ * @param string $risk_level
+ * @param int $limit
+ * @return array
+ */
+function bcc_trust_get_users_by_risk($risk_level, $limit = 100) {
+    global $wpdb;
+    $table = bcc_trust_user_info_table();
+
+    return $wpdb->get_results($wpdb->prepare("
+        SELECT ui.*, u.display_name, u.user_email
+        FROM {$table} ui
+        JOIN {$wpdb->users} u ON ui.user_id = u.ID
+        WHERE ui.risk_level = %s
+        ORDER BY ui.fraud_score DESC
+        LIMIT %d",
+        $risk_level,
+        $limit
+    ));
+}
+
+/**
+ * ======================================================
+ * FINGERPRINT QUERIES
  * ======================================================
  */
 
@@ -182,7 +256,7 @@ function bcc_trust_db_get_suspicious_votes($fraud_threshold = 50, $automation_th
  * @param int $user_id
  * @return array
  */
-function bcc_trust_db_get_user_fingerprints($user_id) {
+function bcc_trust_get_user_fingerprints($user_id) {
     global $wpdb;
     $table = bcc_trust_fingerprints_table();
 
@@ -200,18 +274,20 @@ function bcc_trust_db_get_user_fingerprints($user_id) {
  * @param string $fingerprint
  * @return array
  */
-function bcc_trust_db_get_fingerprint_users($fingerprint) {
+function bcc_trust_get_fingerprint_users($fingerprint) {
     global $wpdb;
     $table = bcc_trust_fingerprints_table();
+    $user_info_table = bcc_trust_user_info_table();
 
     return $wpdb->get_results($wpdb->prepare(
-        "SELECT f.*, u.display_name, u.user_email,
-                COALESCE(uf.meta_value, 0) as fraud_score
+        "SELECT f.*, 
+                u.display_name, 
+                u.user_email,
+                ui.fraud_score,
+                ui.risk_level
          FROM {$table} f
          JOIN {$wpdb->users} u ON f.user_id = u.ID
-         LEFT JOIN {$wpdb->usermeta} uf 
-            ON f.user_id = uf.user_id 
-            AND uf.meta_key = 'bcc_trust_fraud_score'
+         LEFT JOIN {$user_info_table} ui ON f.user_id = ui.user_id
          WHERE f.fingerprint = %s
          ORDER BY f.last_seen DESC",
         $fingerprint
@@ -225,7 +301,7 @@ function bcc_trust_db_get_fingerprint_users($fingerprint) {
  * @param int $automation_threshold
  * @return array
  */
-function bcc_trust_db_get_suspicious_fingerprints($min_users = 2, $automation_threshold = 50) {
+function bcc_trust_get_suspicious_fingerprints($min_users = 2, $automation_threshold = 50) {
     global $wpdb;
     $table = bcc_trust_fingerprints_table();
 
@@ -251,7 +327,7 @@ function bcc_trust_db_get_suspicious_fingerprints($min_users = 2, $automation_th
  *
  * @return object
  */
-function bcc_trust_db_get_fingerprint_stats() {
+function bcc_trust_get_fingerprint_stats() {
     global $wpdb;
     $table = bcc_trust_fingerprints_table();
 
@@ -276,62 +352,26 @@ function bcc_trust_db_get_fingerprint_stats() {
 
 /**
  * ======================================================
- * FRAUD DETECTION QUERIES (NEW)
+ * FRAUD DETECTION QUERIES
  * ======================================================
  */
 
 /**
- * Get users with high fraud scores
- *
- * @param int $threshold
- * @param int $limit
- * @return array
- */
-function bcc_trust_db_get_high_fraud_users($threshold = 50, $limit = 100) {
-    global $wpdb;
-
-    return $wpdb->get_results($wpdb->prepare("
-        SELECT u.ID, u.display_name, u.user_email, u.user_registered,
-               um_fraud.meta_value as fraud_score,
-               um_analysis.meta_value as fraud_analysis,
-               COUNT(DISTINCT v.id) as total_votes,
-               COUNT(DISTINCT e.id) as total_endorsements
-        FROM {$wpdb->users} u
-        JOIN {$wpdb->usermeta} um_fraud 
-            ON u.ID = um_fraud.user_id 
-            AND um_fraud.meta_key = 'bcc_trust_fraud_score'
-        LEFT JOIN {$wpdb->usermeta} um_analysis
-            ON u.ID = um_analysis.user_id 
-            AND um_analysis.meta_key = 'bcc_trust_fraud_analysis'
-        LEFT JOIN " . bcc_trust_votes_table() . " v 
-            ON u.ID = v.voter_user_id AND v.status = 1
-        LEFT JOIN " . bcc_trust_endorsements_table() . " e 
-            ON u.ID = e.endorser_user_id AND e.status = 1
-        WHERE um_fraud.meta_value >= %d
-        GROUP BY u.ID
-        ORDER BY CAST(um_fraud.meta_value AS UNSIGNED) DESC
-        LIMIT %d",
-        $threshold,
-        $limit
-    ));
-}
-
-/**
- * Get fraud score history for a user
+ * Get fraud score history for a user from activity log
  *
  * @param int $user_id
  * @param int $days
  * @return array
  */
-function bcc_trust_db_get_fraud_history($user_id, $days = 30) {
+function bcc_trust_get_fraud_history($user_id, $days = 30) {
     global $wpdb;
     $audit_table = bcc_trust_activity_table();
 
     return $wpdb->get_results($wpdb->prepare(
-        "SELECT created_at, metadata
+        "SELECT created_at, action, target_type, target_id
          FROM {$audit_table}
          WHERE user_id = %d 
-         AND action IN ('fraud_score_increased', 'fraud_detected', 'auto_suspended')
+         AND action IN ('fraud_score_increased', 'fraud_detected', 'user_suspended')
          AND created_at > DATE_SUB(NOW(), INTERVAL %d DAY)
          ORDER BY created_at DESC",
         $user_id,
@@ -340,11 +380,11 @@ function bcc_trust_db_get_fraud_history($user_id, $days = 30) {
 }
 
 /**
- * Get users in vote rings
+ * Get potential vote rings
  *
  * @return array
  */
-function bcc_trust_db_get_vote_rings() {
+function bcc_trust_get_vote_rings() {
     global $wpdb;
     $votes_table = bcc_trust_votes_table();
     $scores_table = bcc_trust_scores_table();
@@ -385,22 +425,22 @@ function bcc_trust_db_get_vote_rings() {
  * @param int $page_id
  * @return object|null
  */
-function bcc_trust_db_get_score_enhanced($page_id) {
+function bcc_trust_get_page_score_enhanced($page_id) {
     global $wpdb;
     $table = bcc_trust_scores_table();
+    $user_info_table = bcc_trust_user_info_table();
 
     $score = $wpdb->get_row($wpdb->prepare(
         "SELECT s.*, 
                 p.post_title,
                 p.post_author,
                 u.display_name as owner_name,
-                COALESCE(uf.meta_value, 0) as owner_fraud_score
+                ui.fraud_score as owner_fraud_score,
+                ui.risk_level as owner_risk_level
          FROM {$table} s
          LEFT JOIN {$wpdb->posts} p ON s.page_id = p.ID
          LEFT JOIN {$wpdb->users} u ON s.page_owner_id = u.ID
-         LEFT JOIN {$wpdb->usermeta} uf 
-            ON s.page_owner_id = uf.user_id 
-            AND uf.meta_key = 'bcc_trust_fraud_score'
+         LEFT JOIN {$user_info_table} ui ON s.page_owner_id = ui.user_id
          WHERE s.page_id = %d",
         $page_id
     ));
@@ -414,23 +454,23 @@ function bcc_trust_db_get_score_enhanced($page_id) {
  * @param int $threshold
  * @return array
  */
-function bcc_trust_db_get_suspicious_pages($threshold = 30) {
+function bcc_trust_get_suspicious_pages($threshold = 30) {
     global $wpdb;
     $scores_table = bcc_trust_scores_table();
     $votes_table = bcc_trust_votes_table();
+    $user_info_table = bcc_trust_user_info_table();
 
     return $wpdb->get_results($wpdb->prepare("
         SELECT s.*, 
                p.post_title,
                COUNT(v.id) as total_votes,
-               SUM(CASE WHEN um.meta_value > 50 THEN 1 ELSE 0 END) as suspicious_votes,
-               AVG(CASE WHEN um.meta_value > 50 THEN v.weight ELSE 0 END) as avg_suspicious_weight
+               SUM(CASE WHEN ui.fraud_score > 50 THEN 1 ELSE 0 END) as suspicious_votes,
+               AVG(CASE WHEN ui.fraud_score > 50 THEN v.weight ELSE 0 END) as avg_suspicious_weight,
+               s.fraud_metadata
         FROM {$scores_table} s
         JOIN {$wpdb->posts} p ON s.page_id = p.ID
         LEFT JOIN {$votes_table} v ON s.page_id = v.page_id AND v.status = 1
-        LEFT JOIN {$wpdb->usermeta} um 
-            ON v.voter_user_id = um.user_id 
-            AND um.meta_key = 'bcc_trust_fraud_score'
+        LEFT JOIN {$user_info_table} ui ON v.voter_user_id = ui.user_id
         GROUP BY s.page_id
         HAVING suspicious_votes > %d
         ORDER BY suspicious_votes DESC",
@@ -440,7 +480,7 @@ function bcc_trust_db_get_suspicious_pages($threshold = 30) {
 
 /**
  * ======================================================
- * BEHAVIORAL PATTERN QUERIES (NEW)
+ * BEHAVIORAL PATTERN QUERIES
  * ======================================================
  */
 
@@ -451,7 +491,7 @@ function bcc_trust_db_get_suspicious_pages($threshold = 30) {
  * @param string $pattern_type
  * @return array
  */
-function bcc_trust_db_get_user_patterns($user_id, $pattern_type = null) {
+function bcc_trust_get_user_patterns($user_id, $pattern_type = null) {
     global $wpdb;
     $table = bcc_trust_patterns_table();
 
@@ -480,7 +520,7 @@ function bcc_trust_db_get_user_patterns($user_id, $pattern_type = null) {
  * @param int $limit
  * @return array
  */
-function bcc_trust_db_get_common_behavior_flags($limit = 20) {
+function bcc_trust_get_common_behavior_flags($limit = 20) {
     global $wpdb;
     $table = bcc_trust_patterns_table();
 
@@ -509,37 +549,31 @@ function bcc_trust_db_get_common_behavior_flags($limit = 20) {
  *
  * @return object
  */
-function bcc_trust_db_get_fraud_stats() {
+function bcc_trust_get_fraud_stats() {
     global $wpdb;
+    $user_info_table = bcc_trust_user_info_table();
+    $fingerprint_table = bcc_trust_fingerprints_table();
+    $votes_table = bcc_trust_votes_table();
+    $scores_table = bcc_trust_scores_table();
 
     $stats = new stdClass();
 
-    // User fraud stats
+    // User fraud stats from user_info table
     $stats->users = $wpdb->get_row("
         SELECT 
-            COUNT(DISTINCT user_id) as users_with_scores,
-            AVG(CAST(meta_value AS UNSIGNED)) as avg_fraud_score,
-            SUM(CASE WHEN CAST(meta_value AS UNSIGNED) >= 80 THEN 1 ELSE 0 END) as critical_risk,
-            SUM(CASE WHEN CAST(meta_value AS UNSIGNED) BETWEEN 60 AND 79 THEN 1 ELSE 0 END) as high_risk,
-            SUM(CASE WHEN CAST(meta_value AS UNSIGNED) BETWEEN 40 AND 59 THEN 1 ELSE 0 END) as medium_risk,
-            SUM(CASE WHEN CAST(meta_value AS UNSIGNED) BETWEEN 20 AND 39 THEN 1 ELSE 0 END) as low_risk,
-            SUM(CASE WHEN CAST(meta_value AS UNSIGNED) < 20 THEN 1 ELSE 0 END) as minimal_risk
-        FROM {$wpdb->usermeta}
-        WHERE meta_key = 'bcc_trust_fraud_score'
-    ");
-
-    // Suspension stats
-    $stats->suspensions = $wpdb->get_row("
-        SELECT 
-            COUNT(*) as total_suspended,
-            SUM(CASE WHEN meta_value = 'auto_suspension' THEN 1 ELSE 0 END) as auto_suspended,
-            SUM(CASE WHEN meta_value != 'auto_suspension' THEN 1 ELSE 0 END) as manually_suspended
-        FROM {$wpdb->usermeta}
-        WHERE meta_key = 'bcc_trust_suspended_reason'
+            COUNT(*) as total_users,
+            AVG(fraud_score) as avg_fraud_score,
+            SUM(CASE WHEN fraud_score >= 80 THEN 1 ELSE 0 END) as critical_risk,
+            SUM(CASE WHEN fraud_score BETWEEN 60 AND 79 THEN 1 ELSE 0 END) as high_risk,
+            SUM(CASE WHEN fraud_score BETWEEN 40 AND 59 THEN 1 ELSE 0 END) as medium_risk,
+            SUM(CASE WHEN fraud_score BETWEEN 20 AND 39 THEN 1 ELSE 0 END) as low_risk,
+            SUM(CASE WHEN fraud_score < 20 THEN 1 ELSE 0 END) as minimal_risk,
+            SUM(CASE WHEN is_suspended = 1 THEN 1 ELSE 0 END) as suspended_users,
+            SUM(CASE WHEN is_verified = 1 THEN 1 ELSE 0 END) as verified_users
+        FROM {$user_info_table}
     ");
 
     // Device stats
-    $fingerprint_table = bcc_trust_fingerprints_table();
     $stats->devices = $wpdb->get_row("
         SELECT 
             COUNT(DISTINCT fingerprint) as unique_devices,
@@ -556,8 +590,6 @@ function bcc_trust_db_get_fraud_stats() {
     ");
 
     // Vote ring stats
-    $votes_table = bcc_trust_votes_table();
-    $scores_table = bcc_trust_scores_table();
     $stats->vote_rings = $wpdb->get_var("
         SELECT COUNT(DISTINCT CONCAT(v1.voter_user_id, '-', v2.voter_user_id))
         FROM {$votes_table} v1
@@ -581,7 +613,7 @@ function bcc_trust_db_get_fraud_stats() {
  * @param int $hours
  * @return object
  */
-function bcc_trust_db_get_activity_summary($hours = 24) {
+function bcc_trust_get_activity_summary($hours = 24) {
     global $wpdb;
     $audit_table = bcc_trust_activity_table();
 
@@ -611,7 +643,7 @@ function bcc_trust_db_get_activity_summary($hours = 24) {
  * @param int $days
  * @return int
  */
-function bcc_trust_db_clean_old_fingerprints($days = 90) {
+function bcc_trust_clean_old_fingerprints($days = 90) {
     global $wpdb;
     $table = bcc_trust_fingerprints_table();
 
@@ -629,7 +661,7 @@ function bcc_trust_db_clean_old_fingerprints($days = 90) {
  * @param int $days
  * @return int
  */
-function bcc_trust_db_clean_old_patterns($days = 30) {
+function bcc_trust_clean_old_patterns($days = 30) {
     global $wpdb;
     $table = bcc_trust_patterns_table();
 
@@ -649,7 +681,7 @@ function bcc_trust_db_clean_old_patterns($days = 30) {
  * @param int $days
  * @return bool
  */
-function bcc_trust_db_archive_old_activity($days = 90) {
+function bcc_trust_archive_old_activity($days = 90) {
     global $wpdb;
     $table = bcc_trust_activity_table();
     $archive_table = $table . '_archive';
@@ -678,7 +710,12 @@ function bcc_trust_db_archive_old_activity($days = 90) {
 
     return $moved !== false;
 }
-// Add to queries.php or create a new admin-ajax.php
+
+/**
+ * ======================================================
+ * AJAX HANDLERS
+ * ======================================================
+ */
 
 /**
  * AJAX handler for syncing a single user

@@ -2,8 +2,10 @@
 /**
  * Plugin Name: Blue Collar Crypto – Trust Engine
  * Description: Core reputation and trust system for Blue Collar Crypto. Handles votes, scoring, and reputation infrastructure.
- * Version: 1.0.0
+ * Version: 2.0.0
  * Author: Blue Collar Labs LLC
+ * Text Domain: bcc-trust
+ * Domain Path: /languages
  */
 
 if (!defined('ABSPATH')) {
@@ -16,13 +18,49 @@ if (!defined('ABSPATH')) {
  * ======================================================
  */
 
-define('BCC_TRUST_VERSION', '1.0.0');
+define('BCC_TRUST_VERSION', '2.0.0');
 define('BCC_TRUST_PATH', plugin_dir_path(__FILE__));
 define('BCC_TRUST_URL', plugin_dir_url(__FILE__));
+define('BCC_TRUST_FILE', __FILE__);
 
 /**
  * ======================================================
- * LOAD BOOTSTRAP
+ * AUTOLOADER
+ * ======================================================
+ */
+
+// First try Composer autoloader
+if (file_exists(BCC_TRUST_PATH . 'vendor/autoload.php')) {
+    require_once BCC_TRUST_PATH . 'vendor/autoload.php';
+} else {
+    // Fallback manual autoloader if Composer not used
+    spl_autoload_register(function ($class) {
+        // Project-specific namespace prefix
+        $prefix = 'BCCTrust\\';
+        $base_dir = BCC_TRUST_PATH . 'app/';
+
+        // Does the class use the namespace prefix?
+        $len = strlen($prefix);
+        if (strncmp($prefix, $class, $len) !== 0) {
+            return;
+        }
+
+        // Get the relative class name
+        $relative_class = substr($class, $len);
+
+        // Replace namespace separators with directory separators
+        $file = $base_dir . str_replace('\\', '/', $relative_class) . '.php';
+
+        // If the file exists, require it
+        if (file_exists($file)) {
+            require $file;
+        }
+    });
+}
+
+/**
+ * ======================================================
+ * BOOTSTRAP
  * ======================================================
  */
 
@@ -30,11 +68,13 @@ require_once BCC_TRUST_PATH . 'bootstrap.php';
 
 /**
  * ======================================================
- * ACTIVATION / UNINSTALL
+ * ACTIVATION / DEACTIVATION / UNINSTALL
  * ======================================================
  */
 
-register_activation_hook(__FILE__, function () {
+register_activation_hook(__FILE__, 'bcc_trust_activate');
+
+function bcc_trust_activate() {
     // Load tables.php
     require_once BCC_TRUST_PATH . 'includes/database/tables.php';
     
@@ -54,6 +94,8 @@ register_activation_hook(__FILE__, function () {
     // Clear any existing cron jobs first
     wp_clear_scheduled_hook('bcc_trust_daily_cleanup');
     wp_clear_scheduled_hook('bcc_trust_hourly_recalc');
+    wp_clear_scheduled_hook('bcc_trust_daily_ml_update');
+    wp_clear_scheduled_hook('bcc_trust_hourly_graph_update');
     
     // Schedule cron jobs
     if (!wp_next_scheduled('bcc_trust_daily_cleanup')) {
@@ -66,16 +108,77 @@ register_activation_hook(__FILE__, function () {
         error_log('BCC Trust: Scheduled hourly recalculation');
     }
     
+    if (!wp_next_scheduled('bcc_trust_daily_ml_update')) {
+        wp_schedule_event(time(), 'daily', 'bcc_trust_daily_ml_update');
+        error_log('BCC Trust: Scheduled daily ML update');
+    }
+    
+    if (!wp_next_scheduled('bcc_trust_hourly_graph_update')) {
+        wp_schedule_event(time(), 'hourly', 'bcc_trust_hourly_graph_update');
+        error_log('BCC Trust: Scheduled hourly graph update');
+    }
+    
+    // Flush rewrite rules for REST API endpoints
+    flush_rewrite_rules();
+    
     error_log('BCC Trust: Activation completed');
-});
+}
 
-register_deactivation_hook(__FILE__, function () {
+register_deactivation_hook(__FILE__, 'bcc_trust_deactivate');
+
+function bcc_trust_deactivate() {
     // Clear scheduled cron jobs
     wp_clear_scheduled_hook('bcc_trust_daily_cleanup');
     wp_clear_scheduled_hook('bcc_trust_hourly_recalc');
+    wp_clear_scheduled_hook('bcc_trust_daily_ml_update');
+    wp_clear_scheduled_hook('bcc_trust_hourly_graph_update');
+    
+    // Flush rewrite rules
+    flush_rewrite_rules();
     
     error_log('BCC Trust: Deactivation completed');
-});
+}
+
+/**
+ * ======================================================
+ * CHECK DATABASE VERSION ON UPGRADE
+ * ======================================================
+ */
+
+add_action('plugins_loaded', 'bcc_trust_check_db_version');
+
+function bcc_trust_check_db_version() {
+    $current_version = get_option('bcc_trust_db_version', '1.0.0');
+    
+    if (version_compare($current_version, BCC_TRUST_VERSION, '<')) {
+        require_once BCC_TRUST_PATH . 'includes/database/tables.php';
+        
+        if (function_exists('bcc_trust_create_tables')) {
+            bcc_trust_create_tables();
+            update_option('bcc_trust_db_version', BCC_TRUST_VERSION);
+            error_log('BCC Trust: Database upgraded to version ' . BCC_TRUST_VERSION);
+        }
+    }
+}
+
+/**
+ * ======================================================
+ * INITIALIZATION
+ * ======================================================
+ */
+
+add_action('plugins_loaded', 'bcc_trust_init');
+
+function bcc_trust_init() {
+    // Load text domain for translations
+    load_plugin_textdomain('bcc-trust', false, dirname(plugin_basename(__FILE__)) . '/languages');
+}
+
+/**
+ * ======================================================
+ * HELPER FUNCTIONS
+ * ======================================================
+ */
 
 /**
  * Render trust widget for a PeepSo page
@@ -83,42 +186,9 @@ register_deactivation_hook(__FILE__, function () {
  * @param array $args Widget arguments
  */
 function bcc_trust_render_widget($args = []) {
-    $page_id = isset($args['page_id']) ? intval($args['page_id']) : 0;
-    
-    if (!$page_id) {
-        return;
+    if (file_exists(BCC_TRUST_PATH . 'templates/trust-widget.php')) {
+        include BCC_TRUST_PATH . 'templates/trust-widget.php';
     }
-    
-    $show_actions = isset($args['show_actions']) ? $args['show_actions'] : true;
-    
-    ?>
-    <div class="bcc-trust-wrapper" 
-         data-page-id="<?php echo esc_attr($page_id); ?>"
-         data-target="<?php echo esc_attr($page_id); ?>">
-        
-        <div class="bcc-trust-header">
-            <strong>Trust Score:</strong>
-            <span class="bcc-score-value">Loading...</span>
-            <span class="bcc-tier-label"></span>
-        </div>
-        
-        <div class="bcc-trust-details" style="font-size:0.9em; color:#666; margin:5px 0;">
-            <span class="bcc-confidence-level"></span>
-            <span class="bcc-vote-total"></span>
-            <span class="bcc-endorsement-total"></span>
-        </div>
-        
-        <?php if ($show_actions && is_user_logged_in()): ?>
-        <div class="bcc-trust-actions" style="margin-top:10px;">
-            <button class="bcc-vote-button button button-small" data-type="1">⬆ Upvote</button>
-            <button class="bcc-vote-button button button-small" data-type="-1">⬇ Downvote</button>
-            <button class="bcc-endorse-button button button-small">⭐ Endorse</button>
-        </div>
-        <?php endif; ?>
-        
-        <div class="bcc-status-message" style="margin-top:8px; min-height:20px;"></div>
-    </div>
-    <?php
 }
 
 // Alias for backward compatibility
@@ -131,18 +201,51 @@ if (!function_exists('bcc_trust_display_widget')) {
     }
 }
 
+
 /**
- * Hook into PeepSo page creation to initialize trust scores
+ * ======================================================
+ * ADMIN NOTICES
+ * ======================================================
+ */
+add_action('admin_notices', 'bcc_trust_admin_notices');
+
+function bcc_trust_admin_notices() {
+    // Only show to admins
+    if (!current_user_can('manage_options')) {
+        return;
+    }
+    
+    // Check if PeepSo is active by looking for its main class
+    if (!class_exists('PeepSo')) {
+        ?>
+        <div class="notice notice-warning is-dismissible">
+            <p><strong>BCC Trust Engine:</strong> PeepSo is not active. Some features may be limited.</p>
+        </div>
+        <?php
+    }
+    
+    // Check database version
+    $db_version = get_option('bcc_trust_db_version', '1.0.0');
+    if (version_compare($db_version, BCC_TRUST_VERSION, '<')) {
+        ?>
+        <div class="notice notice-info is-dismissible">
+            <p><strong>BCC Trust Engine:</strong> Database update available. <a href="<?php echo admin_url('admin.php?page=bcc-trust-dashboard&tab=repair&action=update_db'); ?>">Update now</a>.</p>
+        </div>
+        <?php
+    }
+}
+
+/**
+ * ======================================================
+ * ACTION LINKS
+ * ======================================================
  */
 
-// When a page is created through the dialog
-add_action('peepso_action_page_create_after', 'bcc_trust_handle_page_creation', 10, 2);
+add_filter('plugin_action_links_' . plugin_basename(__FILE__), 'bcc_trust_action_links');
 
-// Alternative: Hook into PeepSo's AJAX page creation
-add_action('wp_ajax_peepso_page_create', 'bcc_trust_handle_ajax_page_creation', 5); // Priority 5 to run before PeepSo's handler
-
-// When page is published/updated via admin
-add_action('save_post_peepso-page', 'bcc_trust_handle_page_save', 10, 3);
-
-// When page owner changes
-add_action('peepso_page_after_owner_change', 'bcc_trust_handle_owner_change', 10, 2);
+function bcc_trust_action_links($links) {
+    $links[] = '<a href="' . admin_url('admin.php?page=bcc-trust-dashboard') . '">Dashboard</a>';
+    $links[] = '<a href="' . admin_url('admin.php?page=bcc-trust-moderation') . '">Moderation</a>';
+    $links[] = '<a href="' . admin_url('admin.php?page=bcc-trust-settings') . '">Settings</a>';
+    return $links;
+}

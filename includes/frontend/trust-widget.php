@@ -7,6 +7,7 @@
  * 
  * @package BCC_Trust_Engine
  * @subpackage Frontend
+ * @version 2.0.0
  */
 
 if (!defined('ABSPATH')) {
@@ -21,9 +22,10 @@ if (!isset($args) || !is_array($args)) {
 
 // Default args
 $args = wp_parse_args($args, [
-    'page_id'       => 0,
-    'show_detailed' => true,
-    'show_actions'  => true
+    'page_id'          => 0,
+    'show_detailed'    => true,
+    'show_actions'     => true,
+    'show_fraud_alerts' => true
 ]);
 
 $page_id = intval($args['page_id']);
@@ -36,7 +38,8 @@ $viewer_id = get_current_user_id();
 
 // Check if required classes exist
 if (!class_exists('\\BCCTrust\\Repositories\\ScoreRepository') || 
-    !class_exists('\\BCCTrust\\Services\\VoteService')) {
+    !class_exists('\\BCCTrust\\Services\\VoteService') ||
+    !class_exists('\\BCCTrust\\Repositories\\UserInfoRepository')) {
     echo '<div class="bcc-trust-error">Trust system not available</div>';
     return;
 }
@@ -51,7 +54,7 @@ if (function_exists('bcc_trust_get_page_owner')) {
 $is_owner = ($viewer_id && $viewer_id == $page_owner_id);
 
 /* ======================================================
- TRUST SCORE DATA
+ TRUST SCORE DATA using PageScore value object
 ====================================================== */
 try {
     $scoreRepo = new \BCCTrust\Repositories\ScoreRepository();
@@ -61,13 +64,16 @@ try {
     $score = null;
 }
 
-$total_score = $score ? floatval($score->total_score) : 50;
-$positive_score = $score ? floatval($score->positive_score) : 0;
-$negative_score = $score ? floatval($score->negative_score) : 0;
-$vote_count = $score ? intval($score->vote_count) : 0;
-$confidence = $score ? floatval($score->confidence_score) : 0;
-$tier = $score ? $score->reputation_tier : 'neutral';
-$endorsement_count = $score ? intval($score->endorsement_count) : 0;
+// Use getter methods from PageScore value object
+$total_score = $score ? $score->getTotalScore() : 50;
+$positive_score = $score ? $score->getPositiveScore() : 0;
+$negative_score = $score ? $score->getNegativeScore() : 0;
+$vote_count = $score ? $score->getVoteCount() : 0;
+$confidence = $score ? $score->getConfidenceScore() : 0;
+$tier = $score ? $score->getReputationTier() : 'neutral';
+$endorsement_count = $score ? $score->getEndorsementCount() : 0;
+$has_fraud_alerts = $score ? $score->hasFraudAlerts() : false;
+$fraud_alert_count = $score ? $score->getFraudAlertCount() : 0;
 
 $confidence_percent = intval($confidence * 100);
 
@@ -77,6 +83,24 @@ if ($confidence_percent >= 80) {
     $confidence_label = "Moderate reliability";
 } else {
     $confidence_label = "Limited voting data";
+}
+
+/* ======================================================
+ USER DATA from user_info table
+====================================================== */
+$user_fraud_score = 0;
+$user_risk_level = 'unknown';
+if ($viewer_id) {
+    try {
+        $userInfoRepo = new \BCCTrust\Repositories\UserInfoRepository();
+        $userInfo = $userInfoRepo->getByUserId($viewer_id);
+        if ($userInfo) {
+            $user_fraud_score = $userInfo->fraud_score;
+            $user_risk_level = $userInfo->risk_level;
+        }
+    } catch (Exception $e) {
+        error_log('BCC Trust: Error getting user info - ' . $e->getMessage());
+    }
 }
 
 /* ======================================================
@@ -103,6 +127,9 @@ if ($viewer_id) {
         error_log('BCC Trust: Error getting endorsement - ' . $e->getMessage());
     }
 }
+
+// Determine if user can vote (not high-risk)
+$can_vote = $viewer_id && !$is_owner && $user_fraud_score < 70;
 ?>
 
 <div class="bcc-trust-wrapper" 
@@ -115,6 +142,12 @@ if ($viewer_id) {
         <strong>Trust Score:</strong>
         <span class="bcc-score-value"><?php echo number_format($total_score, 1); ?></span>
         <span class="bcc-tier-label">(<?php echo esc_html(ucfirst($tier)); ?>)</span>
+        
+        <?php if ($args['show_fraud_alerts'] && $has_fraud_alerts): ?>
+            <span class="bcc-fraud-alert" title="Suspicious activity detected" style="margin-left: 8px; color: #d63638; display: inline-block; animation: pulse 2s infinite;">
+                ⚠️ <?php echo $fraud_alert_count; ?>
+            </span>
+        <?php endif; ?>
     </div>
 
     <!-- ================= DETAILS ================= -->
@@ -146,22 +179,48 @@ if ($viewer_id) {
 
     <?php if ($args['show_actions']): ?>
         <?php if ($viewer_id && !$is_owner): ?>
-            <!-- ================= VOTING ACTIONS ================= -->
-            <div class="bcc-trust-actions" style="margin-top:10px;">
-                <button class="bcc-vote-button button button-small <?php echo $my_vote_type === 1 ? 'active' : ''; ?>"
-                        data-type="1">
-                    ⬆ Upvote
-                </button>
+            <?php if ($user_fraud_score >= 70): ?>
+                <!-- ================= USER IS HIGH-RISK ================= -->
+                <div class="bcc-user-warning" style="margin-top:10px; padding:8px; background:#f8d7da; border-radius:4px; color:#721c24;">
+                    <strong>Account Restricted</strong>
+                    <p style="margin:5px 0 0; font-size:0.9em;">Your account is under review. Voting is temporarily disabled.</p>
+                </div>
+            <?php else: ?>
+                <!-- ================= VOTING ACTIONS ================= -->
+                <div class="bcc-trust-actions" style="margin-top:10px;">
+                    <button class="bcc-vote-button button button-small <?php echo $my_vote_type === 1 ? 'active' : ''; ?>"
+                            data-type="1"
+                            <?php echo $my_vote_type !== 0 ? 'disabled' : ''; ?>>
+                        ⬆ Upvote
+                    </button>
 
-                <button class="bcc-vote-button button button-small <?php echo $my_vote_type === -1 ? 'active' : ''; ?>"
-                        data-type="-1">
-                    ⬇ Downvote
-                </button>
+                    <button class="bcc-vote-button button button-small <?php echo $my_vote_type === -1 ? 'active' : ''; ?>"
+                            data-type="-1"
+                            <?php echo $my_vote_type !== 0 ? 'disabled' : ''; ?>>
+                        ⬇ Downvote
+                    </button>
 
-                <button class="bcc-endorse-button button button-small <?php echo $has_endorsed ? 'revoke' : ''; ?>">
-                    <?php echo $has_endorsed ? 'Revoke Endorsement' : '⭐ Endorse'; ?>
-                </button>
-            </div>
+                    <?php if ($my_vote_type !== 0): ?>
+                        <button class="bcc-remove-vote-button button button-small button-link" style="margin-left:5px;">
+                            Remove Vote
+                        </button>
+                    <?php endif; ?>
+                </div>
+
+                <!-- ================= ENDORSEMENT ACTIONS ================= -->
+                <div class="bcc-endorse-actions" style="margin-top:8px;">
+                    <button class="bcc-endorse-button button button-small <?php echo $has_endorsed ? 'active' : ''; ?>"
+                            <?php echo $has_endorsed ? 'disabled' : ''; ?>>
+                        ⭐ <?php echo $has_endorsed ? 'Endorsed' : 'Endorse'; ?>
+                    </button>
+                    
+                    <?php if ($has_endorsed): ?>
+                        <button class="bcc-revoke-endorse-button button button-small button-link" style="margin-left:5px;">
+                            Revoke
+                        </button>
+                    <?php endif; ?>
+                </div>
+            <?php endif; ?>
         <?php elseif ($is_owner): ?>
             <p class="bcc-owner-notice" style="font-style:italic; color:#999; margin-top:10px; font-size:0.9em;">
                 You cannot vote on your own page
@@ -173,6 +232,44 @@ if ($viewer_id) {
         <?php endif; ?>
     <?php endif; ?>
 
+    <!-- ================= ADMIN ALERTS ================= -->
+    <?php if ($args['show_fraud_alerts'] && $has_fraud_alerts && current_user_can('manage_options')): ?>
+        <div class="bcc-admin-alert" style="margin-top:10px; padding:8px; background:#fff3cd; border-left:4px solid #ffb900; font-size:0.9em;">
+            <strong>⚠️ Admin Notice:</strong> This page has <?php echo $fraud_alert_count; ?> fraud alert(s).
+            <a href="<?php echo esc_url(admin_url('admin.php?page=bcc-trust-dashboard&tab=fraud')); ?>" style="display:block; margin-top:4px;">Review in dashboard →</a>
+        </div>
+    <?php endif; ?>
+
     <!-- ================= STATUS MESSAGE AREA ================= -->
-    <div class="bcc-status-message" style="margin-top:8px; min-height:20px;"></div>
+    <div class="bcc-status-message" style="margin-top:8px; min-height:20px; font-size:0.9em;"></div>
 </div>
+
+<style>
+.bcc-vote-button.active,
+.bcc-endorse-button.active {
+    background: #2271b1;
+    color: white;
+    border-color: #2271b1;
+}
+.bcc-vote-button.active:hover,
+.bcc-endorse-button.active:hover {
+    background: #135e96;
+}
+.bcc-vote-button:disabled,
+.bcc-endorse-button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+.bcc-fraud-alert {
+    display: inline-block;
+    font-weight: bold;
+}
+@keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.6; }
+    100% { opacity: 1; }
+}
+.bcc-status-message.success { color: #00a32a; }
+.bcc-status-message.error { color: #d63638; }
+.bcc-status-message.info { color: #2271b1; }
+</style>

@@ -5,7 +5,7 @@
  * Handles voting operations with PageScore value objects
  * 
  * @package BCCTrust\Services
- * @version 2.0.0
+ * @version 2.1.0
  */
 
 namespace BCCTrust\Services;
@@ -14,6 +14,9 @@ use Exception;
 use BCCTrust\Repositories\VoteRepository;
 use BCCTrust\Repositories\ScoreRepository;
 use BCCTrust\Repositories\ReputationRepository;
+use BCCTrust\Repositories\UserInfoRepository;
+use BCCTrust\Repositories\VerificationRepository;
+use BCCTrust\Repositories\FraudAnalysisRepository;
 use BCCTrust\Security\RateLimiter;
 use BCCTrust\Security\AuditLogger;
 use BCCTrust\Security\TransactionManager;
@@ -31,6 +34,9 @@ class VoteService {
     private VoteRepository $voteRepo;
     private ScoreRepository $scoreRepo;
     private ReputationRepository $reputationRepo;
+    private UserInfoRepository $userInfoRepo;
+    private VerificationRepository $verificationRepo;
+    private FraudAnalysisRepository $fraudAnalysisRepo;
     private DeviceFingerprinter $fingerprinter;
     private BehavioralAnalyzer $behavioralAnalyzer;
     private TrustGraph $trustGraph;
@@ -39,9 +45,16 @@ class VoteService {
         $this->voteRepo = new VoteRepository();
         $this->scoreRepo = new ScoreRepository();
         $this->reputationRepo = new ReputationRepository();
+        $this->userInfoRepo = new UserInfoRepository();
+        $this->verificationRepo = new VerificationRepository();
         $this->fingerprinter = new DeviceFingerprinter();
         $this->behavioralAnalyzer = new BehavioralAnalyzer();
         $this->trustGraph = new TrustGraph();
+        
+        // Initialize fraud analysis repo if class exists
+        if (class_exists('\\BCCTrust\\Repositories\\FraudAnalysisRepository')) {
+            $this->fraudAnalysisRepo = new FraudAnalysisRepository();
+        }
     }
 
     /**
@@ -111,13 +124,15 @@ class VoteService {
         $behavior = $this->behavioralAnalyzer->analyzeUserBehavior($voterId);
 
         // ======================================================
-        // TRUST GRAPH ANALYSIS
+        // TRUST GRAPH ANALYSIS - using user_info table
         // ======================================================
         
-        $trustRank = (float) get_user_meta($voterId, 'bcc_trust_graph_rank', true);
+        $userInfo = $this->userInfoRepo->getByUserId($voterId);
+        $trustRank = $userInfo ? (float) $userInfo->trust_rank : 0;
+        
         if (!$trustRank) {
             $trustRank = $this->trustGraph->calculateTrustRank($voterId);
-            update_user_meta($voterId, 'bcc_trust_graph_rank', $trustRank);
+            $this->userInfoRepo->updateTrustRank($voterId, $trustRank);
         }
 
         // ======================================================
@@ -173,6 +188,17 @@ class VoteService {
             'score_after' => $newScore->getTotalScore()
         ], 'page');
 
+        // Store fraud analysis if high risk
+        if ($automationData['confidence'] > 70 || $deviceFraudProbability > 0.7 || $multiAccountRisk) {
+            $this->storeFraudAnalysis($voterId, $pageId, [
+                'automation_confidence' => $automationData['confidence'],
+                'device_fraud_probability' => $deviceFraudProbability,
+                'multi_account_risk' => $multiAccountRisk,
+                'behavior_score' => $behavior['behavior_score'] ?? 0,
+                'trust_rank' => $trustRank
+            ]);
+        }
+
         // ======================================================
         // EXECUTE IN TRANSACTION
         // ======================================================
@@ -200,7 +226,7 @@ class VoteService {
                 'ip_address'    => $ipBinary
             ]);
 
-            // Update voter's stats
+            // Update voter's stats in user_info table
             $this->updateVoterStats($voterId);
 
             // Log the vote
@@ -229,7 +255,48 @@ class VoteService {
     }
 
     /**
-     * Calculate base vote weight from reputation - FIXED CONSTANT REFERENCES
+     * Store fraud analysis results
+     */
+    private function storeFraudAnalysis(int $userId, int $pageId, array $details): void {
+        if (!$this->fraudAnalysisRepo) {
+            return;
+        }
+
+        $triggers = [];
+        if ($details['automation_confidence'] > 70) {
+            $triggers[] = 'high_automation';
+        }
+        if ($details['device_fraud_probability'] > 0.7) {
+            $triggers[] = 'high_device_fraud';
+        }
+        if ($details['multi_account_risk']) {
+            $triggers[] = 'multi_account_risk';
+        }
+        if (($details['behavior_score'] ?? 0) > 70) {
+            $triggers[] = 'high_risk_behavior';
+        }
+
+        $fraudScore = (int) round(
+            ($details['automation_confidence'] ?? 0) * 0.3 +
+            ($details['device_fraud_probability'] ?? 0) * 100 * 0.3 +
+            ($details['behavior_score'] ?? 0) * 0.4
+        );
+
+        $expiresAt = date('Y-m-d H:i:s', strtotime('+90 days'));
+
+        $this->fraudAnalysisRepo->storeAnalysis(
+            $userId,
+            $fraudScore,
+            FraudDetector::getRiskLevel($fraudScore),
+            $fraudScore / 100,
+            $triggers,
+            array_merge($details, ['page_id' => $pageId]),
+            $expiresAt
+        );
+    }
+
+    /**
+     * Calculate base vote weight from reputation - using user_info table
      */
     private function calculateBaseVoteWeight(int $voterId): float {
         // Base weight for neutral users - use global constants with fallbacks
@@ -237,6 +304,7 @@ class VoteService {
 
         // Get voter's reputation
         $reputation = $this->reputationRepo->getByUserId($voterId);
+        $userInfo = $this->userInfoRepo->getByUserId($voterId);
         
         if ($reputation) {
             $tierWeights = [
@@ -251,9 +319,8 @@ class VoteService {
             $weight = $tierWeights[$tier] ?? $tierWeights['neutral'];
         }
 
-        // Check if voter is verified
-        $verificationRepo = new \BCCTrust\Repositories\VerificationRepository();
-        if ($verificationRepo->isVerified($voterId)) {
+        // Check if voter is verified from user_info
+        if ($userInfo && $userInfo->is_verified) {
             $weight *= 1.1;
         }
 
@@ -289,11 +356,9 @@ class VoteService {
         int $voterId
     ): float {
         $weight = $baseWeight;
-        $adjustments = [];
 
         // Apply diminishing returns for high-weight voters
         if ($weight > 0.3) {
-            $originalWeight = $weight;
             $weight = log10($weight * 10) * 0.3;
             $weight = max(0.15, min(0.6, $weight));
         }
@@ -326,8 +391,10 @@ class VoteService {
             $weight *= (1 + $boost);
         }
 
-        // Fraud score from user meta
-        $fraudScore = (int) get_user_meta($voterId, 'bcc_trust_fraud_score', true);
+        // Fraud score from user_info table
+        $userInfo = $this->userInfoRepo->getByUserId($voterId);
+        $fraudScore = $userInfo ? (int) $userInfo->fraud_score : 0;
+        
         $fraudMedium = defined('BCC_TRUST_FRAUD_MEDIUM') ? BCC_TRUST_FRAUD_MEDIUM : 40;
         if ($fraudScore > $fraudMedium) {
             $weight *= max(0.1, 1 - ($fraudScore / 100));
@@ -381,7 +448,7 @@ class VoteService {
             // Save new score
             $this->scoreRepo->save($newScore);
 
-            // Update voter's stats
+            // Update voter's stats in user_info table
             $this->updateVoterStats($voterId);
 
             // Audit log
@@ -446,6 +513,9 @@ class VoteService {
         $currentScore = $this->scoreRepo->getByPageId($pageId);
         $endorsementCount = $currentScore ? $currentScore->getEndorsementCount() : 0;
 
+        // Get fraud metadata from current score
+        $fraudMetadata = $currentScore ? $currentScore->getFraudMetadata() : null;
+
         // Create new PageScore
         return new PageScore(
             $pageId,
@@ -459,7 +529,8 @@ class VoteService {
             $tier,
             $endorsementCount,
             $lastVoteAt ? new DateTimeImmutable($lastVoteAt) : null,
-            new DateTimeImmutable()
+            new DateTimeImmutable(),
+            $fraudMetadata
         );
     }
 
@@ -549,7 +620,16 @@ class VoteService {
             return [];
         }
 
-        return $this->voteRepo->getByVoter($userId, $limit);
+        $votes = $this->voteRepo->getByVoter($userId, $limit);
+        
+        // Enhance with user_info data
+        $userInfo = $this->userInfoRepo->getByUserId($userId);
+        foreach ($votes as &$vote) {
+            $vote->voter_fraud_score = $userInfo ? $userInfo->fraud_score : 0;
+            $vote->voter_risk_level = $userInfo ? $userInfo->risk_level : 'unknown';
+        }
+        
+        return $votes;
     }
 
     /**
@@ -558,6 +638,7 @@ class VoteService {
     public function getPageVoteStats(int $pageId): array {
         $stats = $this->voteRepo->getPageStats($pageId);
         $counts = $this->voteRepo->getVoteCountsByType($pageId);
+        $score = $this->scoreRepo->getByPageId($pageId);
 
         return [
             'total_votes' => $stats->total_votes ?? 0,
@@ -566,17 +647,21 @@ class VoteService {
             'negative_votes' => $counts['downvotes'],
             'positive_weight' => $counts['upvote_weight'],
             'negative_weight' => $counts['downvote_weight'],
-            'last_vote_at' => $stats->last_vote_at
+            'avg_upvote_weight' => $counts['upvote_avg_weight'] ?? 0,
+            'avg_downvote_weight' => $counts['downvote_avg_weight'] ?? 0,
+            'last_vote_at' => $stats->last_vote_at,
+            'has_fraud_alerts' => $score ? $score->hasFraudAlerts() : false
         ];
     }
 
     /**
-     * Update voter's statistics
+     * Update voter's statistics in user_info table
      */
     private function updateVoterStats(int $voterId): void {
         $voteCount = $this->voteRepo->countByVoter($voterId);
-        update_user_meta($voterId, 'bcc_trust_votes_cast', $voteCount);
-        update_user_meta($voterId, 'bcc_trust_last_active', time());
+        
+        // Update user_info table
+        $this->userInfoRepo->updateVotesCast($voterId, $voteCount);
     }
 
     /**
@@ -653,6 +738,29 @@ class VoteService {
         }
 
         return 'unknown';
+    }
+
+    /**
+     * Get suspicious votes for a page
+     */
+    public function getSuspiciousVotesForPage(int $pageId, float $minFraudScore = 50): array {
+        return $this->voteRepo->getVotesWithFraud($pageId, $minFraudScore);
+    }
+
+    /**
+     * Get vote summary for user
+     */
+    public function getUserVoteSummary(int $userId): array {
+        $userInfo = $this->userInfoRepo->getByUserId($userId);
+        $recentVotes = $this->getUserVotes($userId, 10);
+        
+        return [
+            'user_id' => $userId,
+            'total_votes_cast' => $userInfo ? $userInfo->votes_cast : 0,
+            'recent_votes' => $recentVotes,
+            'vote_weight' => $this->calculateBaseVoteWeight($userId),
+            'fraud_score' => $userInfo ? $userInfo->fraud_score : 0
+        ];
     }
 
     /**
