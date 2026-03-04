@@ -8,6 +8,9 @@
  * - Device fingerprinting
  * - Fraud prevention
  * - Real-time updates
+ * - GitHub verification (redirect approach)
+ * 
+ * @version 2.3.0
  */
 
 (function($) {
@@ -35,10 +38,33 @@
                 initializeWidget($(wrapper));
             });
         });
+
+        // Check for GitHub callback parameters (for redirect approach)
+        const urlParams = new URLSearchParams(window.location.search);
+        const githubVerified = urlParams.get('github_verified');
+        
+        if (githubVerified === 'success') {
+            showMessage($('.bcc-trust-wrapper').first(), 
+                '✓ GitHub account verified successfully! Your trust score has been updated.', 
+                false, 5000);
+            
+            // Clean up URL
+            const newUrl = window.location.pathname + window.location.hash;
+            window.history.replaceState({}, document.title, newUrl);
+        } else if (githubVerified === 'error') {
+            showMessage($('.bcc-trust-wrapper').first(), 
+                '❌ GitHub verification failed. Please try again.', 
+                true, 8000);
+            
+            // Clean up URL
+            const newUrl = window.location.pathname + window.location.hash;
+            window.history.replaceState({}, document.title, newUrl);
+        }
     });
 
     /**
      * Wait for fingerprint to be ready
+     * @returns {Promise}
      */
     function waitForFingerprint() {
         return new Promise((resolve) => {
@@ -58,13 +84,14 @@
 
     /**
      * Initialize a trust widget
+     * @param {jQuery} wrapper - The widget wrapper element
      */
     function initializeWidget(wrapper) {
         const pageId = parseInt(wrapper.data('page-id') || wrapper.data('target'));
         
         console.log('BCC Trust: Initializing widget for page', pageId);
         
-        if (!pageId) {
+        if (!pageId || isNaN(pageId)) {
             console.error('BCC Trust: No page ID found');
             wrapper.find('.bcc-score-value').text('Error');
             wrapper.find('.bcc-status-message').text('Configuration error').css('color', '#f44336');
@@ -85,6 +112,8 @@
 
     /**
      * Load trust score for a PeepSo page
+     * @param {number} pageId - The page ID
+     * @param {jQuery} wrapper - The widget wrapper element
      */
     async function loadPageScore(pageId, wrapper) {
         try {
@@ -100,6 +129,10 @@
                     'Content-Type': 'application/json'
                 }
             });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error ${response.status}`);
+            }
 
             const data = await response.json();
             
@@ -120,6 +153,8 @@
 
     /**
      * Check if user has already voted
+     * @param {number} pageId - The page ID
+     * @param {jQuery} wrapper - The widget wrapper element
      */
     async function checkUserVote(pageId, wrapper) {
         try {
@@ -131,6 +166,10 @@
                     'Content-Type': 'application/json'
                 }
             });
+
+            if (!response.ok) {
+                return;
+            }
 
             const data = await response.json();
             
@@ -151,6 +190,8 @@
 
     /**
      * Update page score display
+     * @param {jQuery} wrapper - The widget wrapper element
+     * @param {Object} data - The score data
      */
     function updatePageScoreDisplay(wrapper, data) {
         // Update main score with animation
@@ -159,13 +200,13 @@
         
         if (!isNaN(currentScore) && !isNaN(newScore) && currentScore !== newScore) {
             animateScoreChange(wrapper, currentScore, newScore);
-        } else {
-            wrapper.find('.bcc-score-value').text(data.total_score);
+        } else if (!isNaN(newScore)) {
+            wrapper.find('.bcc-score-value').text(newScore.toFixed(1));
         }
         
         // Update reputation tier
         const tierEl = wrapper.find('.bcc-tier-label');
-        if (tierEl.length) {
+        if (tierEl.length && data.reputation_tier) {
             tierEl.text('(' + data.reputation_tier + ')').attr('data-tier', data.reputation_tier);
         }
         
@@ -202,8 +243,8 @@
 
         // Update progress bar if exists
         const progressBar = wrapper.find('.bcc-score-progress');
-        if (progressBar.length) {
-            progressBar.css('width', data.total_score + '%');
+        if (progressBar.length && !isNaN(newScore)) {
+            progressBar.css('width', newScore + '%');
         }
 
         // Clear any error messages
@@ -212,6 +253,9 @@
 
     /**
      * Animate score change
+     * @param {jQuery} wrapper - The widget wrapper element
+     * @param {number} oldValue - The old score value
+     * @param {number} newValue - The new score value
      */
     function animateScoreChange(wrapper, oldValue, newValue) {
         const scoreEl = wrapper.find('.bcc-score-value');
@@ -235,23 +279,32 @@
 
     /**
      * Show message to user
+     * @param {jQuery} wrapper - The widget wrapper element
+     * @param {string} message - The message to show
+     * @param {boolean} isError - Whether this is an error message
+     * @param {number} duration - How long to show the message in ms
      */
     function showMessage(wrapper, message, isError = false, duration = 5000) {
         const messageEl = wrapper.find('.bcc-status-message');
-        messageEl.text(message)
+        messageEl.html(message)
             .css('color', isError ? '#f44336' : '#4caf50')
             .fadeIn(300);
         
         // Auto-clear after duration
-        setTimeout(() => {
-            messageEl.fadeOut(300, function() {
-                $(this).text('').css('color', '#666').show();
-            });
-        }, duration);
+        if (duration > 0) {
+            setTimeout(() => {
+                messageEl.fadeOut(300, function() {
+                    $(this).html('').css('color', '#666').show();
+                });
+            }, duration);
+        }
     }
 
     /**
      * Handle page vote action with fingerprint
+     * @param {jQuery} wrapper - The widget wrapper element
+     * @param {number} pageId - The page ID
+     * @param {number} voteType - The vote type (1 for upvote, -1 for downvote)
      */
     async function handlePageVote(wrapper, pageId, voteType) {
         const voteButton = wrapper.find(`.bcc-vote-button[data-type="${voteType}"]`);
@@ -285,6 +338,10 @@
                 })
             });
 
+            if (!response.ok) {
+                throw new Error(`HTTP error ${response.status}`);
+            }
+
             const result = await response.json();
             console.log('BCC Trust: Vote response', result);
 
@@ -317,6 +374,8 @@
 
     /**
      * Handle remove page vote
+     * @param {jQuery} wrapper - The widget wrapper element
+     * @param {number} pageId - The page ID
      */
     async function handleRemovePageVote(wrapper, pageId) {
         const activeButton = wrapper.find('.bcc-vote-button.active');
@@ -338,6 +397,10 @@
                     page_id: pageId
                 })
             });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error ${response.status}`);
+            }
 
             const result = await response.json();
             console.log('BCC Trust: Remove vote response', result);
@@ -362,6 +425,8 @@
 
     /**
      * Handle page endorsement with fingerprint
+     * @param {jQuery} wrapper - The widget wrapper element
+     * @param {number} pageId - The page ID
      */
     async function handlePageEndorsement(wrapper, pageId) {
         const endorseButton = wrapper.find('.bcc-endorse-button');
@@ -395,6 +460,10 @@
                 })
             });
 
+            if (!response.ok) {
+                throw new Error(`HTTP error ${response.status}`);
+            }
+
             const result = await response.json();
             console.log('BCC Trust: Endorse response', result);
 
@@ -418,6 +487,8 @@
 
     /**
      * Handle revoke page endorsement
+     * @param {jQuery} wrapper - The widget wrapper element
+     * @param {number} pageId - The page ID
      */
     async function handleRevokePageEndorsement(wrapper, pageId) {
         const endorseButton = wrapper.find('.bcc-endorse-button.revoke');
@@ -441,6 +512,10 @@
                 })
             });
 
+            if (!response.ok) {
+                throw new Error(`HTTP error ${response.status}`);
+            }
+
             const result = await response.json();
             console.log('BCC Trust: Revoke response', result);
 
@@ -463,6 +538,136 @@
     }
 
     /**
+     * Handle GitHub Connect (redirect approach - no popup)
+     * @param {jQuery} wrapper - The widget wrapper element
+     */
+    async function handleGitHubConnect(wrapper) {
+        const connectButton = wrapper.find('.bcc-github-connect');
+        
+        try {
+            connectButton.prop('disabled', true).text('Redirecting to GitHub...');
+            wrapper.find('.bcc-status-message').text('');
+
+            console.log('BCC Trust: Starting GitHub connection');
+
+            const response = await fetch(window.bccTrust.rest_url + 'github/auth', {
+                method: 'GET',
+                credentials: 'same-origin',
+                headers: {
+                    'X-WP-Nonce': window.bccTrust.nonce,
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error ${response.status}`);
+            }
+
+            const result = await response.json();
+            console.log('BCC Trust: GitHub auth response', result);
+
+            if (result.success && result.data?.auth_url) {
+                // Store current page URL to return to after verification
+                sessionStorage.setItem('bcc_github_return_url', window.location.href);
+                
+                // REDIRECT to GitHub (no popup)
+                window.location.href = result.data.auth_url;
+            } else {
+                throw new Error(result.message || 'Failed to get GitHub auth URL');
+            }
+        } catch (error) {
+            console.error('BCC Trust: GitHub connect error', error);
+            showMessage(wrapper, 'Connection failed: ' + error.message, true, 5000);
+            connectButton.prop('disabled', false).text('Connect GitHub Account');
+        }
+    }
+
+    /**
+     * Check GitHub connection status
+     * @param {jQuery} wrapper - The widget wrapper element
+     */
+    async function checkGitHubStatus(wrapper) {
+        try {
+            const response = await fetch(window.bccTrust.rest_url + 'github/status', {
+                method: 'GET',
+                credentials: 'same-origin',
+                headers: {
+                    'X-WP-Nonce': window.bccTrust.nonce,
+                    'Content-Type': 'application/json'
+                }
+            });
+            
+            if (!response.ok) return;
+            
+            const result = await response.json();
+            
+            if (result.success && result.data?.connected) {
+                showMessage(wrapper, '✓ GitHub connected successfully!', false, 3000);
+                // Reload to show connected state
+                setTimeout(() => {
+                    location.reload();
+                }, 1500);
+            } else {
+                // Not connected, re-enable the button
+                $('.bcc-github-connect').prop('disabled', false).text('Connect GitHub Account');
+            }
+        } catch (error) {
+            console.error('Failed to check GitHub status:', error);
+            $('.bcc-github-connect').prop('disabled', false).text('Connect GitHub Account');
+        }
+    }
+
+    /**
+     * Handle GitHub disconnect
+     * @param {jQuery} wrapper - The widget wrapper element
+     */
+    async function handleGitHubDisconnect(wrapper) {
+        const disconnectButton = wrapper.find('.bcc-github-disconnect');
+        
+        if (!confirm('Are you sure you want to disconnect your GitHub account? This may affect your trust score.')) {
+            return;
+        }
+        
+        try {
+            disconnectButton.prop('disabled', true).text('Disconnecting...');
+            wrapper.find('.bcc-status-message').text('');
+
+            console.log('BCC Trust: Disconnecting GitHub');
+
+            const response = await fetch(window.bccTrust.rest_url + 'github/disconnect', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {
+                    'X-WP-Nonce': window.bccTrust.nonce,
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error ${response.status}`);
+            }
+
+            const result = await response.json();
+            console.log('BCC Trust: GitHub disconnect response', result);
+
+            if (result.success) {
+                showMessage(wrapper, '✓ GitHub disconnected', false, 3000);
+                
+                // Reload the page after a short delay
+                setTimeout(() => {
+                    location.reload();
+                }, 1500);
+            } else {
+                throw new Error(result.message || 'Failed to disconnect GitHub');
+            }
+        } catch (error) {
+            console.error('BCC Trust: GitHub disconnect error', error);
+            showMessage(wrapper, 'Disconnect failed: ' + error.message, true, 5000);
+            disconnectButton.prop('disabled', false).text('Disconnect');
+        }
+    }
+
+    /**
      * Event delegation for trust widgets
      */
     $(document).on('click', '.bcc-trust-wrapper button', function(e) {
@@ -470,40 +675,63 @@
         
         const wrapper = $(this).closest('.bcc-trust-wrapper');
         const pageId = parseInt(wrapper.data('page-id') || wrapper.data('target'));
+        const button = $(this);
         
-        console.log('BCC Trust: Button clicked', {pageId, button: $(this).text()});
+        console.log('BCC Trust: Button clicked', {
+            pageId: pageId,
+            buttonText: button.text().trim(),
+            buttonClass: button.attr('class'),
+            isVote: button.hasClass('bcc-vote-button'),
+            isEndorse: button.hasClass('bcc-endorse-button'),
+            isGitHub: button.hasClass('bcc-github-connect') || button.hasClass('bcc-github-disconnect')
+        });
 
-        if (!pageId) {
+        if (!pageId || isNaN(pageId)) {
             showMessage(wrapper, 'Error: Page ID not found', true);
             return;
         }
 
-        // Check login status
-        if (!window.bccTrust.logged_in) {
-            const loginUrl = window.bccTrust.login_url || '/login';
-            showMessage(wrapper, 'Please <a href="' + loginUrl + '">log in</a> to vote', true, 5000);
+        // Check login status for vote/endorse buttons only
+        if (!window.bccTrust.logged_in && 
+            (button.hasClass('bcc-vote-button') || button.hasClass('bcc-endorse-button'))) {
+            const loginUrl = window.bccTrust.login_url || '/wp-login.php';
+            showMessage(wrapper, 'Please <a href="' + loginUrl + '?redirect_to=' + encodeURIComponent(window.location.href) + '">log in</a> to vote', true, 5000);
             return;
         }
 
         // Vote buttons
-        if ($(this).hasClass('bcc-vote-button')) {
-            const voteType = parseInt($(this).data('type'));
+        if (button.hasClass('bcc-vote-button')) {
+            const voteType = parseInt(button.data('type'));
             
             // If clicking active vote, remove it
-            if ($(this).hasClass('active')) {
+            if (button.hasClass('active')) {
                 handleRemovePageVote(wrapper, pageId);
             } else {
                 handlePageVote(wrapper, pageId, voteType);
             }
+            return;
         }
 
         // Endorse/Revoke button
-        if ($(this).hasClass('bcc-endorse-button')) {
-            if ($(this).hasClass('revoke')) {
+        if (button.hasClass('bcc-endorse-button')) {
+            if (button.hasClass('revoke')) {
                 handleRevokePageEndorsement(wrapper, pageId);
             } else {
                 handlePageEndorsement(wrapper, pageId);
             }
+            return;
+        }
+
+        // GitHub Connect button
+        if (button.hasClass('bcc-github-connect')) {
+            handleGitHubConnect(wrapper);
+            return;
+        }
+
+        // GitHub Disconnect button
+        if (button.hasClass('bcc-github-disconnect')) {
+            handleGitHubDisconnect(wrapper);
+            return;
         }
     });
 

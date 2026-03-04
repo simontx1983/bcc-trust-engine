@@ -78,7 +78,7 @@ function bcc_trust_enqueue_frontend() {
     }
 
     // ======================================================
-    // Frontend CSS
+    // Frontend CSS - Main Styles
     // ======================================================
     if (file_exists($css_path . 'trust-frontend.css')) {
         wp_enqueue_style(
@@ -92,6 +92,18 @@ function bcc_trust_enqueue_frontend() {
         wp_add_inline_style(
             'bcc-trust-frontend',
             bcc_trust_get_dynamic_css()
+        );
+    }
+
+    // ======================================================
+    // Frontend CSS - Vote Specific Styles
+    // ======================================================
+    if (file_exists($css_path . 'trust-vote.css')) {
+        wp_enqueue_style(
+            'bcc-trust-vote',
+            $css_dir . 'trust-vote.css',
+            ['bcc-trust-frontend'], // Depends on main styles
+            BCC_TRUST_VERSION
         );
     }
 }

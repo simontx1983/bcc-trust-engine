@@ -124,36 +124,11 @@ function bcc_trust_time_ago($datetime) {
  */
 function bcc_trust_get_tier_info($tier) {
     $tiers = [
-        'elite' => [
-            'label' => 'Elite', 
-            'color' => '#ffd700', 
-            'icon' => '👑',
-            'description' => 'Highly trusted and influential'
-        ],
-        'trusted' => [
-            'label' => 'Trusted', 
-            'color' => '#4caf50', 
-            'icon' => '⭐',
-            'description' => 'Reliable and consistent'
-        ],
-        'neutral' => [
-            'label' => 'Neutral', 
-            'color' => '#9e9e9e', 
-            'icon' => '➖',
-            'description' => 'Average trust score'
-        ],
-        'caution' => [
-            'label' => 'Caution', 
-            'color' => '#ff9800', 
-            'icon' => '⚠️',
-            'description' => 'Some concerns detected'
-        ],
-        'risky' => [
-            'label' => 'Risky', 
-            'color' => '#f44336', 
-            'icon' => '❗',
-            'description' => 'High risk, proceed with caution'
-        ],
+        'elite' => ['color' => '#ffd700', 'icon' => '👑', 'label' => 'Elite'],
+        'trusted' => ['color' => '#4caf50', 'icon' => '⭐', 'label' => 'Trusted'],
+        'neutral' => ['color' => '#9e9e9e', 'icon' => '○', 'label' => 'Neutral'],
+        'caution' => ['color' => '#ff9800', 'icon' => '⚠️', 'label' => 'Caution'],
+        'risky' => ['color' => '#f44336', 'icon' => '🔴', 'label' => 'Risky']
     ];
     return $tiers[$tier] ?? $tiers['neutral'];
 }
@@ -406,4 +381,81 @@ function bcc_trust_recalculate_page_score($page_id) {
         return $calculator->recalculate_page_score($page_id);
     }
     return false;
+}
+
+function bcc_trust_get_userInfoRepo() {
+    static $repo = null;
+    if ($repo === null && class_exists('\\BCCTrust\\Repositories\\UserInfoRepository')) {
+        $repo = new \BCCTrust\Repositories\UserInfoRepository();
+    }
+    return $repo;
+}
+function bcc_trust_log_audit($action, $data = []) {
+    if (class_exists('\\BCCTrust\\Security\\AuditLogger')) {
+        return \BCCTrust\Security\AuditLogger::log(
+            $action,
+            $data['user_id'] ?? 0,
+            $data,
+            $data['target_type'] ?? 'system'
+        );
+    }
+}
+/**
+ * Render trust widget for a PeepSo page
+ * 
+ * @param array $args Widget arguments
+ */
+function bcc_trust_render_widget($args = []) {
+    // Only proceed if we have a page ID
+    if (empty($args['page_id'])) {
+        return;
+    }
+    
+    // Set default arguments
+    $defaults = [
+        'page_id' => 0,
+        'show_detailed' => true,
+        'show_actions' => true,
+        'show_fraud_alerts' => true,
+        'show_github' => true
+    ];
+    
+    $args = wp_parse_args($args, $defaults);
+    
+    // Include the template with $args variable in scope
+    $template = BCC_TRUST_PATH . 'includes/frontend/trust-widget.php';
+    
+    if (file_exists($template)) {
+        include $template;
+    } else {
+        error_log('BCC Trust: Widget template not found at ' . $template);
+    }
+}
+/**
+ * Decrypt sensitive data
+ */
+function bcc_decrypt(string $data): string {
+
+    if (!defined('BCC_ENCRYPTION_KEY')) {
+        return '';
+    }
+
+    $method = 'AES-256-CBC';
+
+    $key = hash('sha256', BCC_ENCRYPTION_KEY, true);
+
+    $data = base64_decode($data);
+
+    $ivLength = openssl_cipher_iv_length($method);
+
+    $iv = substr($data, 0, $ivLength);
+    $encrypted = substr($data, $ivLength);
+
+    return openssl_decrypt(
+        $encrypted,
+        $method,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv
+    ) ?: '';
 }

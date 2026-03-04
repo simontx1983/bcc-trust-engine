@@ -1,6 +1,6 @@
 /**
  * BCC Trust - Complete Device Fingerprinting
- * @version 1.0.0
+ * @version 1.1.0
  */
 (function() {
     'use strict';
@@ -311,7 +311,7 @@
             let mouseMoved = false;
             let mousePositions = [];
             
-            document.addEventListener('mousemove', function(e) {
+            document.addEventListener('mousemove', (e) => {
                 mouseMoved = true;
                 mousePositions.push({ x: e.clientX, y: e.clientY, time: Date.now() });
                 // Keep only last 10 positions
@@ -320,7 +320,7 @@
             
             // Track scrolling
             let scrolled = false;
-            document.addEventListener('scroll', function() {
+            document.addEventListener('scroll', () => {
                 scrolled = true;
             });
             
@@ -472,7 +472,7 @@
             wrapper.setAttribute('data-fingerprint-ready', 'false');
         });
         
-        fingerprinter.addEventListener('fingerprintReady', () => {
+        document.addEventListener('fingerprintReady', () => {
             document.querySelectorAll('.bcc-trust-wrapper').forEach(wrapper => {
                 wrapper.setAttribute('data-fingerprint-ready', 'true');
                 wrapper.setAttribute('data-fingerprint', fingerprinter.fingerprint.hash);

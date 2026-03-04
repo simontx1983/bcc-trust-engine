@@ -407,3 +407,4 @@ function bcc_trust_filter_page_score_data($data, $page_id) {
 function bcc_trust_filter_user_info_data($data, $user_id) {
     return apply_filters('bcc_trust_user_info_data', $data, $user_id);
 }
+

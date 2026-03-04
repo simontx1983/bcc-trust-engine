@@ -1497,3 +1497,4 @@ function bcc_trust_handle_bulk_suspend() {
     wp_redirect(add_query_arg('bulk', $processed, wp_get_referer()));
     exit;
 }
+
